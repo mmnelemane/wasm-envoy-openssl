@@ -7,6 +7,7 @@ EXTENSIONS = {
     "envoy.access_loggers.file":                        "@envoy//source/extensions/access_loggers/file:config",
     "envoy.access_loggers.http_grpc":                   "@envoy//source/extensions/access_loggers/grpc:http_config",
     "envoy.access_loggers.tcp_grpc":                    "@envoy//source/extensions/access_loggers/grpc:tcp_config",
+    "envoy.access_loggers.wasm":                        "@envoy//source/extensions/access_loggers/wasm:config",
 
     #
     # Clusters
@@ -22,6 +23,11 @@ EXTENSIONS = {
 
     "envoy.grpc_credentials.file_based_metadata":       "@envoy//source/extensions/grpc_credentials/file_based_metadata:config",
     "envoy.grpc_credentials.aws_iam":                   "@envoy_openssl//source/extensions/grpc_credentials/aws_iam:config",
+
+    #
+    # WASM
+    #
+    "envoy.wasm":                                      "@envoy//source/extensions/wasm:config",
 
     #
     # Health checkers
@@ -61,6 +67,7 @@ EXTENSIONS = {
     "envoy.filters.http.router":                        "@envoy//source/extensions/filters/http/router:config",
     "envoy.filters.http.squash":                        "@envoy//source/extensions/filters/http/squash:config",
     "envoy.filters.http.tap":                           "@envoy//source/extensions/filters/http/tap:config",
+    "envoy.filters.http.wasm":                          "@envoy//source/extensions/filters/http/wasm:config",
 
     #
     # Listener filters
@@ -96,6 +103,7 @@ EXTENSIONS = {
     "envoy.filters.network.tcp_proxy":                  "@envoy//source/extensions/filters/network/tcp_proxy:config",
     "envoy.filters.network.thrift_proxy":               "@envoy//source/extensions/filters/network/thrift_proxy:config",
     "envoy.filters.network.sni_cluster":                "@envoy//source/extensions/filters/network/sni_cluster:config",
+    "envoy.filters.network.wasm":                       "@envoy//source/extensions/filters/network/wasm:config",
     "envoy.filters.network.zookeeper_proxy":            "@envoy//source/extensions/filters/network/zookeeper_proxy:config",
 
     #
