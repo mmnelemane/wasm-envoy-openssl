@@ -61,3 +61,29 @@ bind(
     name = "jwt_verify_lib",
     actual = "@com_github_google_jwt_verify_patched//:jwt_verify_lib",
 )
+
+http_archive(
+    name = "rules_antlr",
+    sha256 = "7249d1569293d9b239e23c65f6b4c81a07da921738bde0dfeb231ed98be40429",
+    strip_prefix = "rules_antlr-3cc2f9502a54ceb7b79b37383316b23c4da66f9a",
+    urls = ["https://github.com/marcohu/rules_antlr/archive/3cc2f9502a54ceb7b79b37383316b23c4da66f9a.tar.gz"],
+)
+
+http_archive(
+    name = "antlr4_runtimes",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+cc_library(
+    name = "cpp",
+    srcs = glob(["runtime/Cpp/runtime/src/**/*.cpp"]),
+    hdrs = glob(["runtime/Cpp/runtime/src/**/*.h"]),
+    includes = ["runtime/Cpp/runtime/src"],
+)
+""",
+    sha256 = "992d52444b81ed75e52ea62f9f38ecb7652d5ce2a2130af143912b3042a6d77e",
+    patch_args = ["-p1"],
+    # Patches ASAN violation of initialization fiasco
+    patches = ["@envoy//bazel:antlr.patch"],
+    strip_prefix = "antlr4-4.8",
+    urls = ["https://github.com/antlr/antlr4/archive/4.8.tar.gz"],
+)
