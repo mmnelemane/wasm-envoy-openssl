@@ -87,3 +87,17 @@ cc_library(
     strip_prefix = "antlr4-4.8",
     urls = ["https://github.com/antlr/antlr4/archive/4.8.tar.gz"],
 )
+
+http_archive(
+    name = "proxy_wasm_cpp_host",
+    sha256 = "40558ce134552ba9afb082ad5cf7c2cf157baeb38539810edb43b6eb109596dc",
+    strip_prefix = "proxy-wasm-cpp-host-375ce583a79ca98afa86a2e56f196ea7321d6b1e",
+    urls = ["https://github.com/proxy-wasm/proxy-wasm-cpp-host/archive/375ce583a79ca98afa86a2e56f196ea7321d6b1e.tar.gz"],
+)
+
+http_archive(
+    name = "proxy_wasm_cpp_sdk",
+    sha256 = "f9d744997172333110766a4bcb613206064aebe103dbb9293bc1b532d19a8d7d",
+    strip_prefix = "proxy-wasm-cpp-sdk-9ab06092c4579a74efee16ec37becd42aca66074",
+    urls = ["https://github.com/proxy-wasm/proxy-wasm-cpp-sdk/archive/9ab06092c4579a74efee16ec37becd42aca66074.tar.gz"],
+)
