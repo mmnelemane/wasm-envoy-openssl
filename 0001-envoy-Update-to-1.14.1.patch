@@ -1,0 +1,4187 @@
+From 6c85ffcae61f065a3784fe99274047faca889943 Mon Sep 17 00:00:00 2001
+From: Michal Rostecki <mrostecki@opensuse.org>
+Date: Thu, 7 May 2020 22:04:10 +0200
+Subject: [PATCH] envoy: Update to 1.14.1
+
+This change updates Envoy submodule to tag v1.14.1 and applies necessary
+changes in extensions and tests.
+
+Signed-off-by: Michal Rostecki <mrostecki@opensuse.org>
+---
+ boringssl_compat/cbs.h                        |   6 +-
+ envoy                                         |   2 +-
+ .../extensions/common/crypto/utility_impl.cc  |   5 +-
+ .../extensions/filters/http/lua/lua_filter.cc |   8 +-
+ .../extensions/filters/http/lua/lua_filter.h  |   8 +-
+ .../filters/listener/tls_inspector/config.cc  |  14 +-
+ .../listener/tls_inspector/tls_inspector.cc   |  50 +-
+ .../listener/tls_inspector/tls_inspector.h    |   9 +-
+ .../tls/context_config_impl.cc                |  18 +-
+ .../tls/context_config_impl.h                 |   4 +
+ .../transport_sockets/tls/context_impl.cc     |   4 +-
+ .../transport_sockets/tls/ssl_socket.cc       |   3 +-
+ .../aws_metadata_fetcher_integration_test.cc  |   5 +-
+ .../filters/http/lua/lua_filter_test.cc       |  20 +-
+ .../tls_inspector/tls_inspector_benchmark.cc  |  19 +-
+ .../tls_inspector/tls_inspector_test.cc       |  80 +-
+ .../listener/tls_inspector/tls_utility.cc     |  20 +-
+ .../listener/tls_inspector/tls_utility.h      |  13 +-
+ test/extensions/transport_sockets/tls/BUILD   |  25 +
+ .../tls/context_impl_test.cc                  |  69 ++
+ .../tls/integration/ssl_integration_test.cc   |  38 +-
+ .../transport_sockets/tls/ssl_socket_test.cc  | 685 +++++++++++-------
+ .../tls/test_private_key_method_provider.cc   | 389 ++++++++++
+ .../tls/test_private_key_method_provider.cc~  | 387 ++++++++++
+ .../tls/test_private_key_method_provider.h    |  99 +++
+ test/integration/BUILD                        |  31 +
+ test/integration/autonomous_upstream.cc       |   3 +-
+ test/integration/fake_upstream.cc             |  33 +-
+ test/integration/fake_upstream.h              |  27 +-
+ test/integration/http_integration.cc          | 111 ++-
+ test/integration/http_integration.h           |  14 +-
+ test/integration/integration.cc               |  43 +-
+ test/integration/integration.h                |  20 +-
+ .../listener_filter_integration_test.cc       | 123 ++++
+ test/integration/server.h                     |  18 +-
+ test/mocks/server/mocks.h                     |   2 +
+ 36 files changed, 1926 insertions(+), 479 deletions(-)
+ create mode 100644 test/extensions/transport_sockets/tls/test_private_key_method_provider.cc
+ create mode 100644 test/extensions/transport_sockets/tls/test_private_key_method_provider.cc~
+ create mode 100644 test/extensions/transport_sockets/tls/test_private_key_method_provider.h
+ create mode 100644 test/integration/listener_filter_integration_test.cc
+
+diff --git a/boringssl_compat/cbs.h b/boringssl_compat/cbs.h
+index 07775dc..81d3555 100644
+--- a/boringssl_compat/cbs.h
++++ b/boringssl_compat/cbs.h
+@@ -12,10 +12,10 @@ namespace Extensions {
+ namespace Common {
+ namespace Cbs {
+ 
+-struct CBS {
++typedef struct CBS {
+   const uint8_t* data;
+   size_t len;
+-};
++} CBS;
+ 
+ void CBS_init(CBS* cbs, const uint8_t* data, size_t len);
+ 
+@@ -34,4 +34,4 @@ RSA* RSA_public_key_from_bytes(const uint8_t* in, size_t in_len);
+ } // namespace Extensions
+ } // namespace Envoy
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/envoy b/envoy
+index 56e5b84..3504d40 160000
+--- a/envoy
++++ b/envoy
+@@ -1 +1 @@
+-Subproject commit 56e5b84f4730d124d5080bbb72f88b70d02b99eb
++Subproject commit 3504d40f752eb5c20bc2883053547717bcb92fd8
+diff --git a/source/extensions/common/crypto/utility_impl.cc b/source/extensions/common/crypto/utility_impl.cc
+index 4d4126f..8fe16c3 100644
+--- a/source/extensions/common/crypto/utility_impl.cc
++++ b/source/extensions/common/crypto/utility_impl.cc
+@@ -17,10 +17,7 @@ std::vector<uint8_t> UtilityImpl::getSha256Digest(const Buffer::Instance& buffer
+   EVP_MD_CTX* ctx(EVP_MD_CTX_new());
+   auto rc = EVP_DigestInit(ctx, EVP_sha256());
+   RELEASE_ASSERT(rc == 1, "Failed to init digest context");
+-  const auto num_slices = buffer.getRawSlices(nullptr, 0);
+-  absl::FixedArray<Buffer::RawSlice> slices(num_slices);
+-  buffer.getRawSlices(slices.begin(), num_slices);
+-  for (const auto& slice : slices) {
++  for (const auto& slice : buffer.getRawSlices()) {
+     rc = EVP_DigestUpdate(ctx, slice.mem_, slice.len_);
+     RELEASE_ASSERT(rc == 1, "Failed to update digest");
+   }
+diff --git a/source/extensions/filters/http/lua/lua_filter.cc b/source/extensions/filters/http/lua/lua_filter.cc
+index 2d94234..fc935fa 100644
+--- a/source/extensions/filters/http/lua/lua_filter.cc
++++ b/source/extensions/filters/http/lua/lua_filter.cc
+@@ -295,7 +295,8 @@ int StreamHandleWrapper::luaHttpCallAsynchronous(lua_State* state) {
+   return 0;
+ }
+ 
+-void StreamHandleWrapper::onSuccess(Http::ResponseMessagePtr&& response) {
++void StreamHandleWrapper::onSuccess(const Http::AsyncClient::Request&,
++                                    Http::ResponseMessagePtr&& response) {
+   ASSERT(state_ == State::HttpCall || state_ == State::Running);
+   ENVOY_LOG(debug, "async HTTP response complete");
+   http_request_ = nullptr;
+@@ -341,7 +342,8 @@ void StreamHandleWrapper::onSuccess(Http::ResponseMessagePtr&& response) {
+   }
+ }
+ 
+-void StreamHandleWrapper::onFailure(Http::AsyncClient::FailureReason) {
++void StreamHandleWrapper::onFailure(const Http::AsyncClient::Request& request,
++                                    Http::AsyncClient::FailureReason) {
+   ASSERT(state_ == State::HttpCall || state_ == State::Running);
+   ENVOY_LOG(debug, "async HTTP failure");
+ 
+@@ -351,7 +353,7 @@ void StreamHandleWrapper::onFailure(Http::AsyncClient::FailureReason) {
+           {{Http::Headers::get().Status,
+             std::to_string(enumToInt(Http::Code::ServiceUnavailable))}})));
+   response_message->body() = std::make_unique<Buffer::OwnedImpl>("upstream failure");
+-  onSuccess(std::move(response_message));
++  onSuccess(request, std::move(response_message));
+ }
+ 
+ int StreamHandleWrapper::luaHeaders(lua_State* state) {
+diff --git a/source/extensions/filters/http/lua/lua_filter.h b/source/extensions/filters/http/lua/lua_filter.h
+index ffab53f..88725c5 100644
+--- a/source/extensions/filters/http/lua/lua_filter.h
++++ b/source/extensions/filters/http/lua/lua_filter.h
+@@ -253,8 +253,8 @@ private:
+   }
+ 
+   // Http::AsyncClient::Callbacks
+-  void onSuccess(Http::ResponseMessagePtr&&) override;
+-  void onFailure(Http::AsyncClient::FailureReason) override;
++  void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&&) override;
++  void onFailure(const Http::AsyncClient::Request&, Http::AsyncClient::FailureReason) override;
+ 
+   Filters::Common::Lua::Coroutine& coroutine_;
+   Http::HeaderMap& headers_;
+@@ -283,8 +283,8 @@ private:
+ class NoopCallbacks : public Http::AsyncClient::Callbacks {
+ public:
+   // Http::AsyncClient::Callbacks
+-  void onSuccess(Http::ResponseMessagePtr&&) override {}
+-  void onFailure(Http::AsyncClient::FailureReason) override {}
++  void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&&) override {}
++  void onFailure(const Http::AsyncClient::Request&, Http::AsyncClient::FailureReason) override {}
+ };
+ 
+ /**
+diff --git a/source/extensions/filters/listener/tls_inspector/config.cc b/source/extensions/filters/listener/tls_inspector/config.cc
+index befd05e..058a5dd 100644
+--- a/source/extensions/filters/listener/tls_inspector/config.cc
++++ b/source/extensions/filters/listener/tls_inspector/config.cc
+@@ -19,13 +19,15 @@ namespace TlsInspector {
+ class TlsInspectorConfigFactory : public Server::Configuration::NamedListenerFilterConfigFactory {
+ public:
+   // NamedListenerFilterConfigFactory
+-  Network::ListenerFilterFactoryCb
+-  createFilterFactoryFromProto(const Protobuf::Message&,
+-                               Server::Configuration::ListenerFactoryContext& context) override {
++  Network::ListenerFilterFactoryCb createListenerFilterFactoryFromProto(
++      const Protobuf::Message&,
++      const Network::ListenerFilterMatcherSharedPtr& listener_filter_matcher,
++      Server::Configuration::ListenerFactoryContext& context) override {
+     ConfigSharedPtr config(new Config(context.scope()));
+-    return [config](Network::ListenerFilterManager& filter_manager) -> void {
+-      filter_manager.addAcceptFilter(std::make_unique<Filter>(config));
+-    };
++    return
++        [listener_filter_matcher, config](Network::ListenerFilterManager& filter_manager) -> void {
++          filter_manager.addAcceptFilter(listener_filter_matcher, std::make_unique<Filter>(config));
++        };
+   }
+ 
+   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
+diff --git a/source/extensions/filters/listener/tls_inspector/tls_inspector.cc b/source/extensions/filters/listener/tls_inspector/tls_inspector.cc
+index df1a279..6539bb1 100644
+--- a/source/extensions/filters/listener/tls_inspector/tls_inspector.cc
++++ b/source/extensions/filters/listener/tls_inspector/tls_inspector.cc
+@@ -20,23 +20,30 @@
+ 
+ #include "openssl/ssl.h"
+ 
++#include "boringssl_compat/bssl.h"
++#include "boringssl_compat/cbs.h"
++
+ namespace Envoy {
+ namespace Extensions {
+ namespace ListenerFilters {
+ namespace TlsInspector {
+ 
++// Min/max TLS version recognized by the underlying TLS/SSL library.
++const unsigned Config::TLS_MIN_SUPPORTED_VERSION = TLS1_VERSION;
++const unsigned Config::TLS_MAX_SUPPORTED_VERSION = TLS1_3_VERSION;
++
+ Config::Config(Stats::Scope& scope, uint32_t max_client_hello_size)
+     : stats_{ALL_TLS_INSPECTOR_STATS(POOL_COUNTER_PREFIX(scope, "tls_inspector."))},
+-      ssl_ctx_(
+-          SSL_CTX_new(Envoy::Extensions::ListenerFilters::TlsInspector::TLS_with_buffers_method())),
++      ssl_ctx_(SSL_CTX_new(TLS_with_buffers_method())),
+       max_client_hello_size_(max_client_hello_size) {
++
+   if (max_client_hello_size_ > TLS_MAX_CLIENT_HELLO) {
+     throw EnvoyException(fmt::format("max_client_hello_size of {} is greater than maximum of {}.",
+                                      max_client_hello_size_, size_t(TLS_MAX_CLIENT_HELLO)));
+   }
+ 
+-  SSL_CTX_set_options(ssl_ctx_.get(), SSL_OP_NO_TICKET);
+-  SSL_CTX_set_session_cache_mode(ssl_ctx_.get(), SSL_SESS_CACHE_OFF);
++  SSL_CTX_set_min_proto_version(ssl_ctx_.get(), TLS_MIN_SUPPORTED_VERSION);
++  SSL_CTX_set_max_proto_version(ssl_ctx_.get(), TLS_MAX_SUPPORTED_VERSION);
+ 
+   Envoy::Extensions::ListenerFilters::TlsInspector::set_certificate_cb(ssl_ctx_.get());
+ 
+@@ -44,9 +51,9 @@ Config::Config(Stats::Scope& scope, uint32_t max_client_hello_size)
+     Filter* filter = static_cast<Filter*>(SSL_get_app_data(ssl));
+     absl::string_view servername = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+     filter->onServername(servername);
+-    if (servername.rfind("outbound_") != std::string::npos) {
++    /* if (servername.rfind("outbound_") != std::string::npos) {
+       filter->setIstioApplicationProtocol();
+-    }
++      } */
+ 
+     return Envoy::Extensions::ListenerFilters::TlsInspector::getServernameCallbackReturn(out_alert);
+   };
+@@ -61,13 +68,13 @@ Config::Config(Stats::Scope& scope, uint32_t max_client_hello_size)
+   };
+   SSL_CTX_set_alpn_select_cb(ssl_ctx_.get(), alpn_cb, nullptr);
+ 
+-  auto cert_cb = [](SSL* ssl, void*) -> int {
++  /* auto cert_cb = [](SSL* ssl, void*) -> int {
+     Filter* filter = static_cast<Filter*>(SSL_get_app_data(ssl));
+     filter->onCert();    
+ 
+     return SSL_TLSEXT_ERR_OK;
+   };
+-  SSL_CTX_set_cert_cb(ssl_ctx_.get(), cert_cb, nullptr);
++  SSL_CTX_set_cert_cb(ssl_ctx_.get(), cert_cb, nullptr); */
+ 
+ }
+ 
+@@ -130,18 +137,23 @@ Network::FilterStatus Filter::onAccept(Network::ListenerFilterCallbacks& cb) {
+ }
+ 
+ void Filter::onALPN(const unsigned char* data, unsigned int len) {
+-  std::vector<absl::string_view> protocols =
+-      Envoy::Extensions::ListenerFilters::TlsInspector::getAlpnProtocols(data, len);
+-  cb_->socket().setRequestedApplicationProtocols(protocols);
+-  alpn_found_ = true;
+-}
+-
+-void Filter::onCert() {
++  CBS wire, list;
++  CBS_init(&wire, reinterpret_cast<const uint8_t*>(data), static_cast<size_t>(len));
++  if (!CBS_get_u16_length_prefixed(&wire, &list) || CBS_len(&wire) != 0 || CBS_len(&list) < 2) {
++    // Don't produce errors, let the real TLS stack do it.
++    return;
++  }
++  CBS name;
+   std::vector<absl::string_view> protocols;
+-  if (istio_protocol_required_) {
+-    protocols.emplace_back("istio");
++  while (CBS_len(&list) > 0) {
++    if (!CBS_get_u8_length_prefixed(&list, &name) || CBS_len(&name) == 0) {
++      // Don't produce errors, let the real TLS stack do it.
++      return;
++    }
++    protocols.emplace_back(reinterpret_cast<const char*>(CBS_data(&name)), CBS_len(&name));
+   }
+   cb_->socket().setRequestedApplicationProtocols(protocols);
++  alpn_found_ = true;
+ }
+ 
+ void Filter::onServername(absl::string_view name) {
+@@ -155,10 +167,6 @@ void Filter::onServername(absl::string_view name) {
+   clienthello_success_ = true;
+ }
+ 
+-void Filter::setIstioApplicationProtocol() {
+-  istio_protocol_required_ = true;
+-}
+-
+ ParseState Filter::onRead() {
+   // This receive code is somewhat complicated, because it must be done as a MSG_PEEK because
+   // there is no way for a listener-filter to pass payload data to the ConnectionImpl and filters
+diff --git a/source/extensions/filters/listener/tls_inspector/tls_inspector.h b/source/extensions/filters/listener/tls_inspector/tls_inspector.h
+index 24a67dc..069ea61 100644
+--- a/source/extensions/filters/listener/tls_inspector/tls_inspector.h
++++ b/source/extensions/filters/listener/tls_inspector/tls_inspector.h
+@@ -9,6 +9,7 @@
+ #include "common/common/logger.h"
+ 
+ #include "boringssl_compat/bssl.h"
++#include "boringssl_compat/cbs.h"
+ #include "openssl/ssl.h"
+ 
+ namespace Envoy {
+@@ -57,6 +58,8 @@ public:
+   uint32_t maxClientHelloSize() const { return max_client_hello_size_; }
+ 
+   static constexpr size_t TLS_MAX_CLIENT_HELLO = 64 * 1024;
++  static const unsigned TLS_MIN_SUPPORTED_VERSION;
++  static const unsigned TLS_MAX_SUPPORTED_VERSION;
+ 
+ private:
+   TlsInspectorStats stats_;
+@@ -75,25 +78,21 @@ public:
+ 
+   // Network::ListenerFilter
+   Network::FilterStatus onAccept(Network::ListenerFilterCallbacks& cb) override;
+-  void onALPN(const unsigned char* data, unsigned int len);
+-  void onCert();
+ 
+ private:
+   ParseState parseClientHello(const void* data, size_t len);
+   ParseState onRead();
+   void done(bool success);
++  void onALPN(const unsigned char* data, unsigned int len);
+   void onServername(absl::string_view name);
+-  void setIstioApplicationProtocol();
+ 
+   ConfigSharedPtr config_;
+   Network::ListenerFilterCallbacks* cb_;
+   Event::FileEventPtr file_event_;
+-  Event::TimerPtr timer_;
+ 
+   bssl::UniquePtr<SSL> ssl_;
+   uint64_t read_{0};
+   bool alpn_found_{false};
+-  bool istio_protocol_required_{false};
+   bool clienthello_success_{false};
+ 
+   static thread_local uint8_t buf_[Config::TLS_MAX_CLIENT_HELLO];
+diff --git a/source/extensions/transport_sockets/tls/context_config_impl.cc b/source/extensions/transport_sockets/tls/context_config_impl.cc
+index cb7ed14..41db600 100644
+--- a/source/extensions/transport_sockets/tls/context_config_impl.cc
++++ b/source/extensions/transport_sockets/tls/context_config_impl.cc
+@@ -137,6 +137,8 @@ Secret::TlsSessionTicketKeysConfigProviderSharedPtr getTlsSessionTicketKeysConfi
+       return secret_provider;
+     }
+   }
++  case envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext::
++      SessionTicketKeysTypeCase::kDisableStatelessSessionResumption:
+   case envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext::
+       SessionTicketKeysTypeCase::SESSION_TICKET_KEYS_TYPE_NOT_SET:
+     return nullptr;
+@@ -146,6 +148,17 @@ Secret::TlsSessionTicketKeysConfigProviderSharedPtr getTlsSessionTicketKeysConfi
+   }
+ }
+ 
++bool getStatelessSessionResumptionDisabled(
++    const envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext& config) {
++  if (config.session_ticket_keys_type_case() ==
++      envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext::
++          SessionTicketKeysTypeCase::kDisableStatelessSessionResumption) {
++    return config.disable_stateless_session_resumption();
++  } else {
++    return false;
++  }
++}
++
+ } // namespace
+ 
+ ContextConfigImpl::ContextConfigImpl(
+@@ -359,8 +372,9 @@ ServerContextConfigImpl::ServerContextConfigImpl(
+                         DEFAULT_CIPHER_SUITES, DEFAULT_CURVES, factory_context),
+       require_client_certificate_(
+           PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, require_client_certificate, false)),
+-      session_ticket_keys_provider_(
+-          getTlsSessionTicketKeysConfigProvider(factory_context, config)) {
++      session_ticket_keys_provider_(getTlsSessionTicketKeysConfigProvider(factory_context, config)),
++      disable_stateless_session_resumption_(getStatelessSessionResumptionDisabled(config)) {
++
+   if (session_ticket_keys_provider_ != nullptr) {
+     // Validate tls session ticket keys early to reject bad sds updates.
+     stk_validation_callback_handle_ = session_ticket_keys_provider_->addValidationCallback(
+diff --git a/source/extensions/transport_sockets/tls/context_config_impl.h b/source/extensions/transport_sockets/tls/context_config_impl.h
+index 1abfe48..9cfaff0 100644
+--- a/source/extensions/transport_sockets/tls/context_config_impl.h
++++ b/source/extensions/transport_sockets/tls/context_config_impl.h
+@@ -147,6 +147,9 @@ public:
+   }
+ 
+   void setSecretUpdateCallback(std::function<void()> callback) override;
++  bool disableStatelessSessionResumption() const override {
++    return disable_stateless_session_resumption_;
++  }
+ 
+ private:
+   static const unsigned DEFAULT_MIN_VERSION;
+@@ -165,6 +168,7 @@ private:
+   ServerContextConfig::SessionTicketKey getSessionTicketKey(const std::string& key_data);
+ 
+   absl::optional<std::chrono::seconds> session_timeout_;
++  const bool disable_stateless_session_resumption_;
+ };
+ 
+ } // namespace Tls
+diff --git a/source/extensions/transport_sockets/tls/context_impl.cc b/source/extensions/transport_sockets/tls/context_impl.cc
+index a993136..eb1a0f6 100644
+--- a/source/extensions/transport_sockets/tls/context_impl.cc
++++ b/source/extensions/transport_sockets/tls/context_impl.cc
+@@ -975,7 +975,9 @@ ServerContextImpl::ServerContextImpl(Stats::Scope& scope,
+           this);
+     }
+ 
+-    if (!session_ticket_keys_.empty()) {
++    if (config.disableStatelessSessionResumption()) {
++      SSL_CTX_set_options(ctx.ssl_ctx_.get(), SSL_OP_NO_TICKET);
++    } else if (!session_ticket_keys_.empty()) {
+       SSL_CTX_set_tlsext_ticket_key_cb(
+           ctx.ssl_ctx_.get(),
+           +[](SSL* ssl, unsigned char key_name[16], unsigned char* iv, EVP_CIPHER_CTX* ctx, HMAC_CTX* hmac_ctx,
+diff --git a/source/extensions/transport_sockets/tls/ssl_socket.cc b/source/extensions/transport_sockets/tls/ssl_socket.cc
+index 83bf99b..e4db6b5 100644
+--- a/source/extensions/transport_sockets/tls/ssl_socket.cc
++++ b/source/extensions/transport_sockets/tls/ssl_socket.cc
+@@ -157,8 +157,7 @@ Network::IoResult SslSocket::doRead(Buffer::Instance& read_buffer) {
+     }
+   }
+ 
+-  ENVOY_CONN_LOG(trace, "ssl read {} bytes into {} slices", callbacks_->connection(), bytes_read,
+-                 read_buffer.getRawSlices(nullptr, 0));
++  ENVOY_CONN_LOG(trace, "ssl read {} bytes", callbacks_->connection(), bytes_read);
+ 
+   return {action, bytes_read, end_stream};
+ }
+diff --git a/test/extensions/common/aws/aws_metadata_fetcher_integration_test.cc b/test/extensions/common/aws/aws_metadata_fetcher_integration_test.cc
+index 345b291..499dec1 100644
+--- a/test/extensions/common/aws/aws_metadata_fetcher_integration_test.cc
++++ b/test/extensions/common/aws/aws_metadata_fetcher_integration_test.cc
+@@ -17,7 +17,8 @@ public:
+       : BaseIntegrationTest(Network::Address::IpVersion::v4, renderConfig(status_code, delay_s)) {}
+ 
+   static std::string renderConfig(int status_code, int delay_s) {
+-    return fmt::format(ConfigHelper::BASE_CONFIG + R"EOF(
++    return absl::StrCat(ConfigHelper::baseConfig(),
++                        fmt::format(R"EOF(
+     filter_chains:
+       filters:
+         name: http
+@@ -66,7 +67,7 @@ public:
+               domains: "*"
+             name: route_config_0
+       )EOF",
+-                       delay_s, delay_s > 0 ? 0 : 1000, status_code, status_code);
++                                    delay_s, delay_s > 0 ? 0 : 1000, status_code, status_code));
+   }
+ 
+   void SetUp() override { BaseIntegrationTest::initialize(); }
+diff --git a/test/extensions/filters/http/lua/lua_filter_test.cc b/test/extensions/filters/http/lua/lua_filter_test.cc
+index a0fa418..8de472b 100644
+--- a/test/extensions/filters/http/lua/lua_filter_test.cc
++++ b/test/extensions/filters/http/lua/lua_filter_test.cc
+@@ -797,7 +797,7 @@ TEST_F(LuaHttpFilterTest, HttpCall) {
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq(":status 200")));
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq("response")));
+   EXPECT_CALL(decoder_callbacks_, continueDecoding());
+-  callbacks->onSuccess(std::move(response_message));
++  callbacks->onSuccess(request, std::move(response_message));
+ }
+ 
+ // Basic HTTP request flow. Asynchronous flag set to false.
+@@ -860,7 +860,7 @@ TEST_F(LuaHttpFilterTest, HttpCallAsyncFalse) {
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq(":status 200")));
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq("response")));
+   EXPECT_CALL(decoder_callbacks_, continueDecoding());
+-  callbacks->onSuccess(std::move(response_message));
++  callbacks->onSuccess(request, std::move(response_message));
+ }
+ 
+ // Basic asynchronous, fire-and-forget HTTP request flow.
+@@ -990,14 +990,14 @@ TEST_F(LuaHttpFilterTest, DoubleHttpCall) {
+             callbacks = &cb;
+             return &request;
+           }));
+-  callbacks->onSuccess(std::move(response_message));
++  callbacks->onSuccess(request, std::move(response_message));
+ 
+   response_message = std::make_unique<Http::ResponseMessageImpl>(
+       Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "403"}}});
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq(":status 403")));
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq("no body")));
+   EXPECT_CALL(decoder_callbacks_, continueDecoding());
+-  callbacks->onSuccess(std::move(response_message));
++  callbacks->onSuccess(request, std::move(response_message));
+ 
+   Buffer::OwnedImpl data("hello");
+   EXPECT_EQ(Http::FilterDataStatus::Continue, filter_->decodeData(data, false));
+@@ -1061,7 +1061,7 @@ TEST_F(LuaHttpFilterTest, HttpCallNoBody) {
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq(":status 200")));
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq("no body")));
+   EXPECT_CALL(decoder_callbacks_, continueDecoding());
+-  callbacks->onSuccess(std::move(response_message));
++  callbacks->onSuccess(request, std::move(response_message));
+ }
+ 
+ // HTTP call followed by immediate response.
+@@ -1114,7 +1114,7 @@ TEST_F(LuaHttpFilterTest, HttpCallImmediateResponse) {
+                                            {"set-cookie", "flavor=chocolate; Path=/"},
+                                            {"set-cookie", "variant=chewy; Path=/"}};
+   EXPECT_CALL(decoder_callbacks_, encodeHeaders_(HeaderMapEqualRef(&expected_headers), true));
+-  callbacks->onSuccess(std::move(response_message));
++  callbacks->onSuccess(request, std::move(response_message));
+ }
+ 
+ // HTTP call with script error after resume.
+@@ -1162,7 +1162,7 @@ TEST_F(LuaHttpFilterTest, HttpCallErrorAfterResumeSuccess) {
+               scriptLog(spdlog::level::err,
+                         StrEq("[string \"...\"]:14: attempt to index local 'foo' (a nil value)")));
+   EXPECT_CALL(decoder_callbacks_, continueDecoding());
+-  callbacks->onSuccess(std::move(response_message));
++  callbacks->onSuccess(request, std::move(response_message));
+ }
+ 
+ // HTTP call failure.
+@@ -1207,7 +1207,7 @@ TEST_F(LuaHttpFilterTest, HttpCallFailure) {
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq(":status 503")));
+   EXPECT_CALL(*filter_, scriptLog(spdlog::level::trace, StrEq("upstream failure")));
+   EXPECT_CALL(decoder_callbacks_, continueDecoding());
+-  callbacks->onFailure(Http::AsyncClient::FailureReason::Reset);
++  callbacks->onFailure(request, Http::AsyncClient::FailureReason::Reset);
+ }
+ 
+ // HTTP call reset.
+@@ -1283,7 +1283,9 @@ TEST_F(LuaHttpFilterTest, HttpCallImmediateFailure) {
+       .WillOnce(
+           Invoke([&](Http::RequestMessagePtr&, Http::AsyncClient::Callbacks& cb,
+                      const Http::AsyncClient::RequestOptions&) -> Http::AsyncClient::Request* {
+-            cb.onFailure(Http::AsyncClient::FailureReason::Reset);
++            cb.onFailure(request, Http::AsyncClient::FailureReason::Reset);
++            // Intentionally return nullptr (instead of request handle) to trigger a particular
++            // code path.
+             return nullptr;
+           }));
+ 
+diff --git a/test/extensions/filters/listener/tls_inspector/tls_inspector_benchmark.cc b/test/extensions/filters/listener/tls_inspector/tls_inspector_benchmark.cc
+index f20bbd3..7cb0915 100644
+--- a/test/extensions/filters/listener/tls_inspector/tls_inspector_benchmark.cc
++++ b/test/extensions/filters/listener/tls_inspector/tls_inspector_benchmark.cc
+@@ -67,7 +67,9 @@ public:
+ };
+ 
+ static void BM_TlsInspector(benchmark::State& state) {
+-  NiceMock<FastMockOsSysCalls> os_sys_calls(Envoy::Extensions::ListenerFilters::TlsInspector::Test::generateClientHello("example.com", "\x02h2\x08http/1.1"));
++  NiceMock<FastMockOsSysCalls> os_sys_calls(Tls::Test::generateClientHello(
++      Config::TLS_MIN_SUPPORTED_VERSION, Config::TLS_MAX_SUPPORTED_VERSION, "example.com",
++      "\x02h2\x08http/1.1"));
+   TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls{&os_sys_calls};
+   NiceMock<Stats::MockStore> store;
+   ConfigSharedPtr cfg(std::make_shared<Config>(store));
+@@ -79,7 +81,7 @@ static void BM_TlsInspector(benchmark::State& state) {
+   for (auto _ : state) {
+     Filter filter(cfg);
+     filter.onAccept(cb);
+-    dispatcher.file_event_callback_(Event::FileReadyType::Read);
++    RELEASE_ASSERT(dispatcher.file_event_callback_ == nullptr, "");
+     RELEASE_ASSERT(socket.detectedTransportProtocol() == "tls", "");
+     RELEASE_ASSERT(socket.requestedServerName() == "example.com", "");
+     RELEASE_ASSERT(socket.requestedApplicationProtocols().size() == 2 &&
+@@ -97,16 +99,3 @@ BENCHMARK(BM_TlsInspector)->Unit(benchmark::kMicrosecond);
+ } // namespace ListenerFilters
+ } // namespace Extensions
+ } // namespace Envoy
+-
+-// Boilerplate main(), which discovers benchmarks in the same file and runs them.
+-int main(int argc, char** argv) {
+-  Envoy::Thread::MutexBasicLockable lock;
+-  Envoy::Logger::Context logging_context(spdlog::level::warn,
+-                                         Envoy::Logger::Logger::DEFAULT_LOG_FORMAT, lock, false);
+-
+-  benchmark::Initialize(&argc, argv);
+-  if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
+-    return 1;
+-  }
+-  benchmark::RunSpecifiedBenchmarks();
+-}
+diff --git a/test/extensions/filters/listener/tls_inspector/tls_inspector_test.cc b/test/extensions/filters/listener/tls_inspector/tls_inspector_test.cc
+index 3b478bd..1969cac 100644
+--- a/test/extensions/filters/listener/tls_inspector/tls_inspector_test.cc
++++ b/test/extensions/filters/listener/tls_inspector/tls_inspector_test.cc
+@@ -27,7 +27,7 @@ namespace ListenerFilters {
+ namespace TlsInspector {
+ namespace {
+ 
+-class TlsInspectorTest : public testing::Test {
++class TlsInspectorTest : public testing::TestWithParam<std::tuple<uint16_t, uint16_t>> {
+ public:
+   TlsInspectorTest()
+       : cfg_(std::make_shared<Config>(store_)),
+@@ -41,6 +41,13 @@ public:
+     EXPECT_CALL(cb_, dispatcher()).WillRepeatedly(ReturnRef(dispatcher_));
+     EXPECT_CALL(socket_, ioHandle()).WillRepeatedly(ReturnRef(*io_handle_));
+ 
++    // Prepare the first recv attempt during
++    EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
++        .WillOnce(
++            Invoke([](os_fd_t fd, void* buffer, size_t length, int flag) -> Api::SysCallSizeResult {
++              ENVOY_LOG_MISC(error, "In mock syscall recv {} {} {} {}", fd, buffer, length, flag);
++              return Api::SysCallSizeResult{static_cast<ssize_t>(0), 0};
++            }));
+     EXPECT_CALL(dispatcher_,
+                 createFileEvent_(_, _, Event::FileTriggerType::Edge,
+                                  Event::FileReadyType::Read | Event::FileReadyType::Closed))
+@@ -61,14 +68,22 @@ public:
+   Network::IoHandlePtr io_handle_;
+ };
+ 
++INSTANTIATE_TEST_SUITE_P(TlsProtocolVersions, TlsInspectorTest,
++                         testing::Values(std::make_tuple(Config::TLS_MIN_SUPPORTED_VERSION,
++                                                         Config::TLS_MAX_SUPPORTED_VERSION),
++                                         std::make_tuple(TLS1_VERSION, TLS1_VERSION),
++                                         std::make_tuple(TLS1_1_VERSION, TLS1_1_VERSION),
++                                         std::make_tuple(TLS1_2_VERSION, TLS1_2_VERSION),
++                                         std::make_tuple(TLS1_3_VERSION, TLS1_3_VERSION)));
++
+ // Test that an exception is thrown for an invalid value for max_client_hello_size
+-TEST_F(TlsInspectorTest, MaxClientHelloSize) {
++TEST_P(TlsInspectorTest, MaxClientHelloSize) {
+   EXPECT_THROW_WITH_MESSAGE(Config(store_, Config::TLS_MAX_CLIENT_HELLO + 1), EnvoyException,
+                             "max_client_hello_size of 65537 is greater than maximum of 65536.");
+ }
+ 
+ // Test that the filter detects Closed events and terminates.
+-TEST_F(TlsInspectorTest, ConnectionClosed) {
++TEST_P(TlsInspectorTest, ConnectionClosed) {
+   init();
+   EXPECT_CALL(cb_, continueFilterChain(false));
+   file_event_callback_(Event::FileReadyType::Closed);
+@@ -76,7 +91,7 @@ TEST_F(TlsInspectorTest, ConnectionClosed) {
+ }
+ 
+ // Test that the filter detects detects read errors.
+-TEST_F(TlsInspectorTest, ReadError) {
++TEST_P(TlsInspectorTest, ReadError) {
+   init();
+   EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK)).WillOnce(InvokeWithoutArgs([]() {
+     return Api::SysCallSizeResult{ssize_t(-1), ENOTSUP};
+@@ -87,11 +102,11 @@ TEST_F(TlsInspectorTest, ReadError) {
+ }
+ 
+ // Test that a ClientHello with an SNI value causes the correct name notification.
+-TEST_F(TlsInspectorTest, SniRegistered) {
++TEST_P(TlsInspectorTest, SniRegistered) {
+   init();
+   const std::string servername("example.com");
+-  std::vector<uint8_t> client_hello =
+-      Envoy::Extensions::ListenerFilters::TlsInspector::Test::generateClientHello(servername, "");
++  std::vector<uint8_t> client_hello = Tls::Test::generateClientHello(
++      std::get<0>(GetParam()), std::get<1>(GetParam()), servername, "");
+   EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+       .WillOnce(Invoke(
+           [&client_hello](os_fd_t, void* buffer, size_t length, int) -> Api::SysCallSizeResult {
+@@ -100,8 +115,7 @@ TEST_F(TlsInspectorTest, SniRegistered) {
+             return Api::SysCallSizeResult{ssize_t(client_hello.size()), 0};
+           }));
+   EXPECT_CALL(socket_, setRequestedServerName(Eq(servername)));
+-  // Not valid for ALPN "istio" application protocol hack for openssl
+-  EXPECT_CALL(socket_, setRequestedApplicationProtocols(_)).Times(1);
++  EXPECT_CALL(socket_, setRequestedApplicationProtocols(_)).Times(0);
+   EXPECT_CALL(socket_, setDetectedTransportProtocol(absl::string_view("tls")));
+   EXPECT_CALL(cb_, continueFilterChain(true));
+   file_event_callback_(Event::FileReadyType::Read);
+@@ -111,13 +125,12 @@ TEST_F(TlsInspectorTest, SniRegistered) {
+ }
+ 
+ // Test that a ClientHello with an ALPN value causes the correct name notification.
+-TEST_F(TlsInspectorTest, AlpnRegistered) {
++TEST_P(TlsInspectorTest, AlpnRegistered) {
+   init();
+   const std::vector<absl::string_view> alpn_protos = {absl::string_view("h2"),
+                                                       absl::string_view("http/1.1")};
+-  std::vector<uint8_t> client_hello =
+-      Envoy::Extensions::ListenerFilters::TlsInspector::Test::generateClientHello("",
+-                                                                            "\x02h2\x08http/1.1");
++  std::vector<uint8_t> client_hello = Tls::Test::generateClientHello(
++      std::get<0>(GetParam()), std::get<1>(GetParam()), "", "\x02h2\x08http/1.1");
+   EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+       .WillOnce(Invoke(
+           [&client_hello](os_fd_t, void* buffer, size_t length, int) -> Api::SysCallSizeResult {
+@@ -136,12 +149,12 @@ TEST_F(TlsInspectorTest, AlpnRegistered) {
+ }
+ 
+ // Test with the ClientHello spread over multiple socket reads.
+-TEST_F(TlsInspectorTest, MultipleReads) {
++TEST_P(TlsInspectorTest, MultipleReads) {
+   init();
+   const std::vector<absl::string_view> alpn_protos = {absl::string_view("h2")};
+   const std::string servername("example.com");
+-  std::vector<uint8_t> client_hello =
+-      Envoy::Extensions::ListenerFilters::TlsInspector::Test::generateClientHello(servername, "\x02h2");
++  std::vector<uint8_t> client_hello = Tls::Test::generateClientHello(
++      std::get<0>(GetParam()), std::get<1>(GetParam()), servername, "\x02h2");
+   {
+     InSequence s;
+     EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+@@ -175,10 +188,10 @@ TEST_F(TlsInspectorTest, MultipleReads) {
+ }
+ 
+ // Test that the filter correctly handles a ClientHello with no extensions present.
+-TEST_F(TlsInspectorTest, NoExtensions) {
++TEST_P(TlsInspectorTest, NoExtensions) {
+   init();
+   std::vector<uint8_t> client_hello =
+-      Envoy::Extensions::ListenerFilters::TlsInspector::Test::generateClientHello("", "");
++      Tls::Test::generateClientHello(std::get<0>(GetParam()), std::get<1>(GetParam()), "", "");
+   EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+       .WillOnce(Invoke(
+           [&client_hello](os_fd_t, void* buffer, size_t length, int) -> Api::SysCallSizeResult {
+@@ -187,8 +200,7 @@ TEST_F(TlsInspectorTest, NoExtensions) {
+             return Api::SysCallSizeResult{ssize_t(client_hello.size()), 0};
+           }));
+   EXPECT_CALL(socket_, setRequestedServerName(_)).Times(0);
+-// 0 times not valid for ALPN "istio" application protocol hack for openssl
+-  EXPECT_CALL(socket_, setRequestedApplicationProtocols(_)).Times(1);
++  EXPECT_CALL(socket_, setRequestedApplicationProtocols(_)).Times(0);
+   EXPECT_CALL(socket_, setDetectedTransportProtocol(absl::string_view("tls")));
+   EXPECT_CALL(cb_, continueFilterChain(true));
+   file_event_callback_(Event::FileReadyType::Read);
+@@ -199,11 +211,11 @@ TEST_F(TlsInspectorTest, NoExtensions) {
+ 
+ // Test that the filter fails if the ClientHello is larger than the
+ // maximum allowed size.
+-TEST_F(TlsInspectorTest, ClientHelloTooBig) {
++TEST_P(TlsInspectorTest, ClientHelloTooBig) {
+   const size_t max_size = 50;
+   cfg_ = std::make_shared<Config>(store_, static_cast<uint32_t>(max_size));
+-  std::vector<uint8_t> client_hello =
+-      Envoy::Extensions::ListenerFilters::TlsInspector::Test::generateClientHello("example.com", "");
++  std::vector<uint8_t> client_hello = Tls::Test::generateClientHello(
++      std::get<0>(GetParam()), std::get<1>(GetParam()), "example.com", "");
+   ASSERT(client_hello.size() > max_size);
+   init();
+   EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+@@ -219,7 +231,7 @@ TEST_F(TlsInspectorTest, ClientHelloTooBig) {
+ }
+ 
+ // Test that the filter fails on non-SSL data
+-TEST_F(TlsInspectorTest, NotSsl) {
++TEST_P(TlsInspectorTest, NotSsl) {
+   init();
+   std::vector<uint8_t> data;
+ 
+@@ -238,7 +250,7 @@ TEST_F(TlsInspectorTest, NotSsl) {
+   EXPECT_EQ(1, cfg_->stats().tls_not_found_.value());
+ }
+ 
+-TEST_F(TlsInspectorTest, InlineReadSucceed) {
++TEST_P(TlsInspectorTest, InlineReadSucceed) {
+   filter_ = std::make_unique<Filter>(cfg_);
+ 
+   EXPECT_CALL(cb_, socket()).WillRepeatedly(ReturnRef(socket_));
+@@ -246,17 +258,17 @@ TEST_F(TlsInspectorTest, InlineReadSucceed) {
+   EXPECT_CALL(socket_, ioHandle()).WillRepeatedly(ReturnRef(*io_handle_));
+   const std::vector<absl::string_view> alpn_protos = {absl::string_view("h2")};
+   const std::string servername("example.com");
+-  std::vector<uint8_t> client_hello =
+-      Envoy::Extensions::ListenerFilters::TlsInspector::Test::generateClientHello(servername, "\x02h2");
++  std::vector<uint8_t> client_hello = Tls::Test::generateClientHello(
++      std::get<0>(GetParam()), std::get<1>(GetParam()), servername, "\x02h2");
+ 
+   EXPECT_CALL(os_sys_calls_, recv(42, _, _, MSG_PEEK))
+-      .WillOnce(Invoke(
+-          [&client_hello](int fd, void* buffer, size_t length, int flag) -> Api::SysCallSizeResult {
+-            ENVOY_LOG_MISC(trace, "In mock syscall recv {} {} {} {}", fd, buffer, length, flag);
+-            ASSERT(length >= client_hello.size());
+-            memcpy(buffer, client_hello.data(), client_hello.size());
+-            return Api::SysCallSizeResult{ssize_t(client_hello.size()), 0};
+-          }));
++      .WillOnce(Invoke([&client_hello](os_fd_t fd, void* buffer, size_t length,
++                                       int flag) -> Api::SysCallSizeResult {
++        ENVOY_LOG_MISC(trace, "In mock syscall recv {} {} {} {}", fd, buffer, length, flag);
++        ASSERT(length >= client_hello.size());
++        memcpy(buffer, client_hello.data(), client_hello.size());
++        return Api::SysCallSizeResult{ssize_t(client_hello.size()), 0};
++      }));
+ 
+   // No event is created if the inline recv parse the hello.
+   EXPECT_CALL(dispatcher_,
+diff --git a/test/extensions/filters/listener/tls_inspector/tls_utility.cc b/test/extensions/filters/listener/tls_inspector/tls_utility.cc
+index 5e4ac37..fefbecd 100644
+--- a/test/extensions/filters/listener/tls_inspector/tls_utility.cc
++++ b/test/extensions/filters/listener/tls_inspector/tls_utility.cc
+@@ -8,17 +8,15 @@
+ #include "openssl/ssl.h"
+ 
+ namespace Envoy {
+-namespace Extensions {
+-namespace ListenerFilters {
+-namespace TlsInspector {
++namespace Tls {
+ namespace Test {
+ 
+-std::vector<uint8_t> generateClientHello(const std::string& sni_name, const std::string& alpn) {
+-  bssl::UniquePtr<SSL_CTX> ctx(
+-      SSL_CTX_new(Envoy::Extensions::ListenerFilters::TlsInspector::TLS_with_buffers_method()));
++std::vector<uint8_t> generateClientHello(uint16_t tls_min_version, uint16_t tls_max_version,
++                                         const std::string& sni_name, const std::string& alpn) {
++  bssl::UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_with_buffers_method()));
+ 
+-  const long flags = SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION;
+-  SSL_CTX_set_options(ctx.get(), flags);
++  SSL_CTX_set_min_proto_version(ctx.get(), tls_min_version);
++  SSL_CTX_set_max_proto_version(ctx.get(), tls_max_version);
+ 
+   bssl::UniquePtr<SSL> ssl(SSL_new(ctx.get()));
+ 
+@@ -37,7 +35,7 @@ std::vector<uint8_t> generateClientHello(const std::string& sni_name, const std:
+     SSL_set_alpn_protos(ssl.get(), reinterpret_cast<const uint8_t*>(alpn.data()), alpn.size());
+   }
+   SSL_do_handshake(ssl.get());
+-  const uint8_t* data = NULL;
++  const uint8_t* data = nullptr;
+   size_t data_len = 0;
+   BIO_mem_contents(out, &data, &data_len);
+   ASSERT(data_len > 0);
+@@ -46,7 +44,5 @@ std::vector<uint8_t> generateClientHello(const std::string& sni_name, const std:
+ }
+ 
+ } // namespace Test
+-} // namespace TlsInspector
+-} // namespace ListenerFilters
+-} // namespace Extensions
++} // namespace Tls
+ } // namespace Envoy
+diff --git a/test/extensions/filters/listener/tls_inspector/tls_utility.h b/test/extensions/filters/listener/tls_inspector/tls_utility.h
+index 4912e09..13e911e 100644
+--- a/test/extensions/filters/listener/tls_inspector/tls_utility.h
++++ b/test/extensions/filters/listener/tls_inspector/tls_utility.h
+@@ -4,22 +4,21 @@
+ #include <vector>
+ 
+ namespace Envoy {
+-namespace Extensions {
+-namespace ListenerFilters {
+-namespace TlsInspector {
++namespace Tls {
+ namespace Test {
+ 
+ /**
+  * Generate a TLS ClientHello in wire-format.
++ * @param tls_min_version Minimum supported TLS version to advertise.
++ * @param tls_max_version Maximum supported TLS version to advertise.
+  * @param sni_name The name to include as a Server Name Indication.
+  *                 No SNI extension is added if sni_name is empty.
+  * @param alpn Protocol(s) list in the wire-format (i.e. 8-bit length-prefixed string) to advertise
+  *             in Application-Layer Protocol Negotiation. No ALPN is advertised if alpn is empty.
+  */
+-std::vector<uint8_t> generateClientHello(const std::string& sni_name, const std::string& alpn);
++std::vector<uint8_t> generateClientHello(uint16_t tls_min_version, uint16_t tls_max_version,
++                                         const std::string& sni_name, const std::string& alpn);
+ 
+ } // namespace Test
+-} // namespace TlsInspector
+-} // namespace ListenerFilters
+-} // namespace Extensions
++} // namespace Tls
+ } // namespace Envoy
+diff --git a/test/extensions/transport_sockets/tls/BUILD b/test/extensions/transport_sockets/tls/BUILD
+index fb5f540..e59a274 100644
+--- a/test/extensions/transport_sockets/tls/BUILD
++++ b/test/extensions/transport_sockets/tls/BUILD
+@@ -26,6 +26,7 @@ envoy_cc_test(
+     external_deps = ["ssl"],
+     shard_count = 4,
+     deps = [
++        ":test_private_key_method_provider_test_lib",
+         "@envoy//include/envoy/network:transport_socket_interface",
+         "@envoy//source/common/buffer:buffer_lib",
+         "@envoy//source/common/common:empty_string",
+@@ -41,6 +42,7 @@ envoy_cc_test(
+ 	"//source/extensions/transport_sockets/tls:context_lib",
+ 	"//source/extensions/transport_sockets/tls:ssl_socket_lib",
+ 	"//source/extensions/transport_sockets/tls:utility_lib",
++        "//source/extensions/transport_sockets/tls/private_key:private_key_manager_lib",
+         "@envoy//test/extensions/transport_sockets/tls/test_data:cert_infos",
+         "@envoy//test/mocks/buffer:buffer_mocks",
+         "@envoy//test/mocks/network:network_mocks",
+@@ -123,3 +125,26 @@ envoy_cc_test_library(
+         "@envoy//test/test_common:environment_lib",
+     ],
+ )
++
++envoy_cc_test_library(
++    name = "test_private_key_method_provider_test_lib",
++    repository = "@envoy",
++    srcs = [
++        "test_private_key_method_provider.cc",
++    ],
++    hdrs = [
++        "test_private_key_method_provider.h",
++    ],
++    external_deps = ["ssl"],
++    deps = [
++        "//boringssl_compat:bssl_compat_lib",
++        "@envoy//include/envoy/api:api_interface",
++        "@envoy//include/envoy/event:dispatcher_interface",
++        "@envoy//include/envoy/server:transport_socket_config_interface",
++        "@envoy//include/envoy/ssl/private_key:private_key_config_interface",
++        "@envoy//include/envoy/ssl/private_key:private_key_interface",
++        "@envoy//source/common/config:utility_lib",
++        "@envoy//source/common/protobuf:utility_lib",
++        "@envoy_api//envoy/extensions/transport_sockets/tls/v3:pkg_cc_proto",
++    ],
++)
+diff --git a/test/extensions/transport_sockets/tls/context_impl_test.cc b/test/extensions/transport_sockets/tls/context_impl_test.cc
+index 181f027..664e4ce 100644
+--- a/test/extensions/transport_sockets/tls/context_impl_test.cc
++++ b/test/extensions/transport_sockets/tls/context_impl_test.cc
+@@ -609,6 +609,75 @@ TEST_F(SslServerContextImplTicketTest, VerifySanWithNoCA) {
+                             "is insecure and not allowed");
+ }
+ 
++TEST_F(SslServerContextImplTicketTest, StatelessSessionResumptionEnabledByDefault) {
++  envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
++  const std::string tls_context_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_tmpdir }}/unittestcert.pem"
++      private_key:
++        filename: "{{ test_tmpdir }}/unittestkey.pem"
++  )EOF";
++  TestUtility::loadFromYaml(TestEnvironment::substitute(tls_context_yaml), tls_context);
++
++  ServerContextConfigImpl server_context_config(tls_context, factory_context_);
++  EXPECT_FALSE(server_context_config.disableStatelessSessionResumption());
++}
++
++TEST_F(SslServerContextImplTicketTest, StatelessSessionResumptionExplicitlyEnabled) {
++  envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
++  const std::string tls_context_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_tmpdir }}/unittestcert.pem"
++      private_key:
++        filename: "{{ test_tmpdir }}/unittestkey.pem"
++  disable_stateless_session_resumption: false
++  )EOF";
++  TestUtility::loadFromYaml(TestEnvironment::substitute(tls_context_yaml), tls_context);
++
++  ServerContextConfigImpl server_context_config(tls_context, factory_context_);
++  EXPECT_FALSE(server_context_config.disableStatelessSessionResumption());
++}
++
++TEST_F(SslServerContextImplTicketTest, StatelessSessionResumptionDisabled) {
++  envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
++  const std::string tls_context_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_tmpdir }}/unittestcert.pem"
++      private_key:
++        filename: "{{ test_tmpdir }}/unittestkey.pem"
++  disable_stateless_session_resumption: true
++  )EOF";
++  TestUtility::loadFromYaml(TestEnvironment::substitute(tls_context_yaml), tls_context);
++
++  ServerContextConfigImpl server_context_config(tls_context, factory_context_);
++  EXPECT_TRUE(server_context_config.disableStatelessSessionResumption());
++}
++
++TEST_F(SslServerContextImplTicketTest, StatelessSessionResumptionEnabledWhenKeyIsConfigured) {
++  envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
++  const std::string tls_context_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_tmpdir }}/unittestcert.pem"
++      private_key:
++        filename: "{{ test_tmpdir }}/unittestkey.pem"
++  session_ticket_keys:
++    keys:
++      filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ticket_key_a"
++)EOF";
++  TestUtility::loadFromYaml(TestEnvironment::substitute(tls_context_yaml), tls_context);
++
++  ServerContextConfigImpl server_context_config(tls_context, factory_context_);
++  EXPECT_FALSE(server_context_config.disableStatelessSessionResumption());
++}
++
+ class ClientContextConfigImplTest : public SslCertsTest {};
+ 
+ // Validate that empty SNI (according to C string rules) fails config validation.
+diff --git a/test/extensions/transport_sockets/tls/integration/ssl_integration_test.cc b/test/extensions/transport_sockets/tls/integration/ssl_integration_test.cc
+index 48187a3..bd75573 100644
+--- a/test/extensions/transport_sockets/tls/integration/ssl_integration_test.cc
++++ b/test/extensions/transport_sockets/tls/integration/ssl_integration_test.cc
+@@ -89,7 +89,7 @@ TEST_P(SslIntegrationTest, RouterRequestAndResponseWithGiantBodyBuffer) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection({});
+   };
+-  testRouterRequestAndResponseWithBody(16 * 1024 * 1024, 16 * 1024 * 1024, false, &creator);
++  testRouterRequestAndResponseWithBody(16 * 1024 * 1024, 16 * 1024 * 1024, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -97,7 +97,7 @@ TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBuffer) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection({});
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -108,7 +108,7 @@ TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBufferHttp2) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection(ClientSslTransportOptions().setAlpn(true));
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -116,7 +116,7 @@ TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBufferVerifySAN) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection(ClientSslTransportOptions().setSan(true));
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -125,7 +125,7 @@ TEST_P(SslIntegrationTest, RouterRequestAndResponseWithBodyNoBufferHttp2VerifySA
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection(ClientSslTransportOptions().setAlpn(true).setSan(true));
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -198,28 +198,20 @@ public:
+   void TearDown() override { SslIntegrationTestBase::TearDown(); };
+ 
+   ClientSslTransportOptions rsaOnlyClientOptions() {
+-    /*
+     if (tls_version_ == envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_3) {
+-    */
+       return ClientSslTransportOptions().setSigningAlgorithmsForTest("rsa_pss_rsae_sha256");
+-    /*
+     } else {
+       return ClientSslTransportOptions().setCipherSuites({"ECDHE-RSA-AES128-GCM-SHA256"});
+     }
+-    */
+   }
+ 
+   ClientSslTransportOptions ecdsaOnlyClientOptions() {
+     auto options = ClientSslTransportOptions().setClientEcdsaCert(true);
+-    /*
+     if (tls_version_ == envoy::extensions::transport_sockets::tls::v3::TlsParameters::TLSv1_3) {
+-    */
+       return options.setSigningAlgorithmsForTest("ecdsa_secp256r1_sha256");
+-    /*
+     } else {
+       return options.setCipherSuites({"ECDHE-ECDSA-AES128-GCM-SHA256"});
+     }
+-    */
+   }
+ 
+   static std::string ipClientVersionTestParamsToString(
+@@ -252,7 +244,7 @@ TEST_P(SslCertficateIntegrationTest, ServerRsa) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection({});
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -263,7 +255,7 @@ TEST_P(SslCertficateIntegrationTest, ServerEcdsa) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection({});
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -274,7 +266,7 @@ TEST_P(SslCertficateIntegrationTest, ServerRsaEcdsa) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection({});
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -285,7 +277,7 @@ TEST_P(SslCertficateIntegrationTest, ClientRsaOnly) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection(rsaOnlyClientOptions());
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -310,7 +302,7 @@ TEST_P(SslCertficateIntegrationTest, ServerRsaEcdsaClientRsaOnly) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection(rsaOnlyClientOptions());
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -337,7 +329,7 @@ TEST_P(SslCertficateIntegrationTest, ServerEcdsaClientEcdsaOnly) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection(ecdsaOnlyClientOptions());
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -349,7 +341,7 @@ TEST_P(SslCertficateIntegrationTest, ServerRsaEcdsaClientEcdsaOnly) {
+   ConnectionCreationFunction creator = [&]() -> Network::ClientConnectionPtr {
+     return makeSslClientConnection(ecdsaOnlyClientOptions());
+   };
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+ }
+ 
+@@ -377,7 +369,7 @@ public:
+         bootstrap.mutable_static_resources()->mutable_clusters(0)->mutable_transport_socket();
+     transport_socket->set_name("envoy.transport_sockets.tap");
+     envoy::config::core::v3::TransportSocket raw_transport_socket;
+-    raw_transport_socket.set_name("raw_buffer");
++    raw_transport_socket.set_name("envoy.transport_sockets.raw_buffer");
+     envoy::extensions::transport_sockets::tap::v3::Tap tap_config =
+         createTapConfig(raw_transport_socket);
+     tap_config.mutable_transport_socket()->MergeFrom(raw_transport_socket);
+@@ -558,7 +550,7 @@ TEST_P(SslTapIntegrationTest, RequestWithTextProto) {
+     return makeSslClientConnection({});
+   };
+   const uint64_t id = Network::ConnectionImpl::nextGlobalIdForTest() + 1;
+-  testRouterRequestAndResponseWithBody(1024, 512, false, &creator);
++  testRouterRequestAndResponseWithBody(1024, 512, false, false, &creator);
+   checkStats();
+   codec_client_->close();
+   test_server_->waitForCounterGe("http.config_test.downstream_cx_destroy", 1);
+@@ -584,7 +576,7 @@ TEST_P(SslTapIntegrationTest, RequestWithJsonBodyAsStringUpstreamTap) {
+     return makeSslClientConnection({});
+   };
+   const uint64_t id = Network::ConnectionImpl::nextGlobalIdForTest() + 2;
+-  testRouterRequestAndResponseWithBody(512, 1024, false, &creator);
++  testRouterRequestAndResponseWithBody(512, 1024, false, false, &creator);
+   checkStats();
+   codec_client_->close();
+   test_server_->waitForCounterGe("http.config_test.downstream_cx_destroy", 1);
+diff --git a/test/extensions/transport_sockets/tls/ssl_socket_test.cc b/test/extensions/transport_sockets/tls/ssl_socket_test.cc
+index d49ff36..1f19df4 100644
+--- a/test/extensions/transport_sockets/tls/ssl_socket_test.cc
++++ b/test/extensions/transport_sockets/tls/ssl_socket_test.cc
+@@ -18,15 +18,19 @@
+ 
+ #include "extensions/transport_sockets/tls/context_config_impl.h"
+ #include "extensions/transport_sockets/tls/context_impl.h"
++#include "extensions/transport_sockets/tls/private_key/private_key_manager_impl.h"
+ #include "extensions/transport_sockets/tls/ssl_socket.h"
+ 
+ #include "test/extensions/transport_sockets/tls/ssl_certs_test.h"
++#include "test/extensions/transport_sockets/tls/test_data/ca_cert_info.h"
++#include "test/extensions/transport_sockets/tls/test_data/extensions_cert_info.h"
+ #include "test/extensions/transport_sockets/tls/test_data/no_san_cert_info.h"
+ #include "test/extensions/transport_sockets/tls/test_data/password_protected_cert_info.h"
+ #include "test/extensions/transport_sockets/tls/test_data/san_dns2_cert_info.h"
+ #include "test/extensions/transport_sockets/tls/test_data/san_dns_cert_info.h"
+ #include "test/extensions/transport_sockets/tls/test_data/san_uri_cert_info.h"
+ #include "test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_cert_info.h"
++#include "test/extensions/transport_sockets/tls/test_private_key_method_provider.h"
+ #include "test/mocks/buffer/mocks.h"
+ #include "test/mocks/network/mocks.h"
+ #include "test/mocks/secret/mocks.h"
+@@ -105,7 +109,7 @@ public:
+                   bool expect_success, Network::Address::IpVersion version)
+       : TestUtilOptionsBase(expect_success, version), client_ctx_yaml_(client_ctx_yaml),
+         server_ctx_yaml_(server_ctx_yaml), expect_no_cert_(false), expect_no_cert_chain_(false),
+-        expect_premature_disconnect_(false),
++        expect_private_key_method_(false),
+         expected_server_close_event_(Network::ConnectionEvent::RemoteClose) {
+     if (expect_success) {
+       setExpectedServerStats("ssl.handshake");
+@@ -136,13 +140,6 @@ public:
+     return *this;
+   }
+ 
+-  bool expectPrematureDisconnect() const { return expect_premature_disconnect_; }
+-
+-  TestUtilOptions& setExpectPrematureDisconnect() {
+-    expect_premature_disconnect_ = true;
+-    return *this;
+-  }
+-
+   TestUtilOptions& setExpectedClientCertUri(const std::string& expected_client_cert_uri) {
+     TestUtilOptionsBase::setExpectedClientCertUri(expected_client_cert_uri);
+     return *this;
+@@ -222,6 +219,13 @@ public:
+     return expected_expiration_peer_cert_;
+   }
+ 
++  TestUtilOptions& setPrivateKeyMethodExpected(bool expected_method) {
++    expect_private_key_method_ = expected_method;
++    return *this;
++  }
++
++  bool expectedPrivateKeyMethod() const { return expect_private_key_method_; }
++
+   TestUtilOptions& setExpectedServerCloseEvent(Network::ConnectionEvent expected_event) {
+     expected_server_close_event_ = expected_event;
+     return *this;
+@@ -229,13 +233,25 @@ public:
+ 
+   Network::ConnectionEvent expectedServerCloseEvent() const { return expected_server_close_event_; }
+ 
++  TestUtilOptions& addExpected509Extension(absl::string_view name,
++                                           absl::optional<std::string> value) {
++    expected_x509_extensions_[name] = std::move(value);
++
++    return *this;
++  }
++
++  const absl::flat_hash_map<std::string, absl::optional<std::string>>&
++  expectedX509Extensions() const {
++    return expected_x509_extensions_;
++  }
++
+ private:
+   const std::string client_ctx_yaml_;
+   const std::string server_ctx_yaml_;
+ 
+   bool expect_no_cert_;
+   bool expect_no_cert_chain_;
+-  bool expect_premature_disconnect_;
++  bool expect_private_key_method_;
+   Network::ConnectionEvent expected_server_close_event_;
+   std::string expected_digest_;
+   std::vector<std::string> expected_local_uri_;
+@@ -247,17 +263,33 @@ private:
+   std::string expected_peer_cert_chain_;
+   std::string expected_valid_from_peer_cert_;
+   std::string expected_expiration_peer_cert_;
++  absl::flat_hash_map<std::string, absl::optional<std::string>> expected_x509_extensions_;
+ };
+ 
+ void testUtil(const TestUtilOptions& options) {
+   Event::SimulatedTimeSystem time_system;
+ 
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   Api::ApiPtr server_api = Api::createApiForTest(server_stats_store, time_system);
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
+       server_factory_context;
+   ON_CALL(server_factory_context, api()).WillByDefault(ReturnRef(*server_api));
+ 
++  // For private key method testing.
++  NiceMock<Ssl::MockContextManager> context_manager;
++  Extensions::PrivateKeyMethodProvider::TestPrivateKeyMethodFactory test_factory;
++  Registry::InjectFactory<Ssl::PrivateKeyMethodProviderInstanceFactory>
++      test_private_key_method_factory(test_factory);
++  PrivateKeyMethodManagerImpl private_key_method_manager;
++  if (options.expectedPrivateKeyMethod()) {
++    EXPECT_CALL(server_factory_context, sslContextManager())
++        .WillOnce(ReturnRef(context_manager))
++        .WillRepeatedly(ReturnRef(context_manager));
++    EXPECT_CALL(context_manager, privateKeyMethodManager())
++        .WillOnce(ReturnRef(private_key_method_manager))
++        .WillRepeatedly(ReturnRef(private_key_method_manager));
++  }
++
+   envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext server_tls_context;
+   TestUtility::loadFromYaml(TestEnvironment::substitute(options.serverCtxYaml()),
+                             server_tls_context);
+@@ -278,7 +310,7 @@ void testUtil(const TestUtilOptions& options) {
+   TestUtility::loadFromYaml(TestEnvironment::substitute(options.clientCtxYaml()),
+                             client_tls_context);
+ 
+-  Stats::IsolatedStoreImpl client_stats_store;
++  Stats::TestUtil::TestStore client_stats_store;
+   Api::ApiPtr client_api = Api::createApiForTest(client_stats_store, time_system);
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
+       client_factory_context;
+@@ -291,13 +323,14 @@ void testUtil(const TestUtilOptions& options) {
+   Network::ClientConnectionPtr client_connection = dispatcher->createClientConnection(
+       socket->localAddress(), Network::Address::InstanceConstSharedPtr(),
+       client_ssl_socket_factory.createTransportSocket(nullptr), nullptr);
+-  client_connection_ptr = client_connection.get();
+   Network::ConnectionPtr server_connection;
+   Network::MockConnectionCallbacks server_connection_callbacks;
++  StreamInfo::MockStreamInfo stream_info;
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection = dispatcher->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+ 
+@@ -371,6 +404,11 @@ void testUtil(const TestUtilOptions& options) {
+         EXPECT_EQ(EMPTY_STRING,
+                   server_connection->ssl()->urlEncodedPemEncodedPeerCertificateChain());
+       }
++
++      for (const auto& expected_extension : options.expectedX509Extensions()) {
++        const auto& result = server_connection->ssl()->x509Extension(expected_extension.first);
++        EXPECT_EQ(expected_extension.second, result);
++      }
+       // By default, the session is not created with session resumption. The
+       // client should see a session ID but the server should not.
+       EXPECT_EQ(EMPTY_STRING, server_connection->ssl()->sessionId());
+@@ -396,12 +434,6 @@ void testUtil(const TestUtilOptions& options) {
+         .WillOnce(Invoke([&](Network::ConnectionEvent) -> void { connect_second_time(); }));
+     EXPECT_CALL(client_connection_callbacks, onEvent(Network::ConnectionEvent::LocalClose));
+     EXPECT_CALL(server_connection_callbacks, onEvent(Network::ConnectionEvent::LocalClose));
+-  } else if (options.expectPrematureDisconnect()) {
+-    EXPECT_CALL(client_connection_callbacks, onEvent(Network::ConnectionEvent::LocalClose))
+-        .WillOnce(Invoke([&](Network::ConnectionEvent) -> void {
+-          server_connection->close(Network::ConnectionCloseType::NoFlush);
+-        }));
+-    EXPECT_CALL(server_connection_callbacks, onEvent(Network::ConnectionEvent::LocalClose));
+   } else {
+     EXPECT_CALL(client_connection_callbacks, onEvent(Network::ConnectionEvent::RemoteClose))
+         .WillOnce(Invoke([&](Network::ConnectionEvent) -> void { close_second_time(); }));
+@@ -409,8 +441,7 @@ void testUtil(const TestUtilOptions& options) {
+         .WillOnce(Invoke([&](Network::ConnectionEvent) -> void { close_second_time(); }));
+   }
+ 
+-  dispatcher->run(options.expectPrematureDisconnect() ? Event::Dispatcher::RunType::NonBlock
+-                                                      : Event::Dispatcher::RunType::Block);
++  dispatcher->run(Event::Dispatcher::RunType::Block);
+ 
+   if (!options.expectedServerStats().empty()) {
+     EXPECT_EQ(1UL, server_stats_store.counter(options.expectedServerStats()).value());
+@@ -545,7 +576,7 @@ const std::string testUtilV2(const TestUtilOptionsV2& options) {
+   const auto& filter_chain = options.listener().filter_chains(0);
+   std::vector<std::string> server_names(filter_chain.filter_chain_match().server_names().begin(),
+                                         filter_chain.filter_chain_match().server_names().end());
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   Api::ApiPtr server_api = Api::createApiForTest(server_stats_store, time_system);
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
+       server_factory_context;
+@@ -563,7 +594,7 @@ const std::string testUtilV2(const TestUtilOptionsV2& options) {
+   Network::MockConnectionHandler connection_handler;
+   Network::ListenerPtr listener = dispatcher->createListener(socket, callbacks, true);
+ 
+-  Stats::IsolatedStoreImpl client_stats_store;
++  Stats::TestUtil::TestStore client_stats_store;
+   Api::ApiPtr client_api = Api::createApiForTest(client_stats_store, time_system);
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
+       client_factory_context;
+@@ -583,8 +614,8 @@ const std::string testUtilV2(const TestUtilOptionsV2& options) {
+     SSL* client_ssl_socket = ssl_socket->rawSslForTest();
+     SSL_CTX* client_ssl_context = SSL_get_SSL_CTX(client_ssl_socket);
+     SSL_SESSION* client_ssl_session =
+-        Envoy::Extensions::TransportSockets::Tls::ssl_session_from_bytes(
+-            client_ssl_socket, client_ssl_context, options.clientSession());
++        SSL_SESSION_from_bytes(reinterpret_cast<const uint8_t*>(options.clientSession().data()),
++                               options.clientSession().size(), client_ssl_context);
+     int rc = SSL_set_session(client_ssl_socket, client_ssl_session);
+     ASSERT(rc == 1);
+     SSL_SESSION_free(client_ssl_session);
+@@ -592,6 +623,7 @@ const std::string testUtilV2(const TestUtilOptionsV2& options) {
+ 
+   Network::ConnectionPtr server_connection;
+   Network::MockConnectionCallbacks server_connection_callbacks;
++  StreamInfo::MockStreamInfo stream_info;
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         std::string sni = options.transportSocketOptions() != nullptr &&
+@@ -600,7 +632,8 @@ const std::string testUtilV2(const TestUtilOptionsV2& options) {
+                               : options.clientCtxProto().sni();
+         socket->setRequestedServerName(sni);
+         server_connection = dispatcher->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+ 
+@@ -660,8 +693,7 @@ const std::string testUtilV2(const TestUtilOptionsV2& options) {
+       */
+       uint8_t* session_data;
+       size_t session_len;
+-      int rc = Envoy::Extensions::TransportSockets::Tls::ssl_session_to_bytes(
+-          client_ssl_session, &session_data, &session_len);
++      int rc = SSL_SESSION_to_bytes(client_ssl_session, &session_data, &session_len);
+       ASSERT(rc == 1);
+       new_session = std::string(reinterpret_cast<char*>(session_data), session_len);
+       OPENSSL_free(session_data);
+@@ -754,13 +786,14 @@ void configureServerAndExpiredClientCertificate(
+ class SslSocketTest : public SslCertsTest,
+                       public testing::WithParamInterface<Network::Address::IpVersion> {
+ protected:
+-  SslSocketTest() : dispatcher_(api_->allocateDispatcher()) {}
++  SslSocketTest() : dispatcher_(api_->allocateDispatcher()), stream_info_(api_->timeSource()) {}
+ 
+   void testClientSessionResumption(const std::string& server_ctx_yaml,
+                                    const std::string& client_ctx_yaml, bool expect_reuse,
+                                    const Network::Address::IpVersion version);
+ 
+   Event::DispatcherPtr dispatcher_;
++  StreamInfo::StreamInfoImpl stream_info_;
+ };
+ 
+ INSTANTIATE_TEST_SUITE_P(IpVersions, SslSocketTest,
+@@ -1258,8 +1291,7 @@ TEST_P(SslSocketTest, GetPeerCertChain) {
+   std::string expected_peer_cert_chain =
+       TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
+           "{{ test_rundir "
+-          "}}/test/extensions/transport_sockets/tls/test_data/intermediate_ca_cert.pem"));
+-          //"}}/test/extensions/transport_sockets/tls/test_data/no_san_chain.pem"));
++          "}}/test/extensions/transport_sockets/tls/test_data/no_san_chain.pem"));
+   testUtil(test_options.setExpectedSerialNumber(TEST_NO_SAN_CERT_SERIAL)
+                .setExpectedPeerCertChain(expected_peer_cert_chain));
+ }
+@@ -1389,6 +1421,36 @@ TEST_P(SslSocketTest, FailedClientAuthSanVerification) {
+   testUtil(test_options.setExpectedServerStats("ssl.fail_verify_san"));
+ }
+ 
++TEST_P(SslSocketTest, X509Extensions) {
++  const std::string client_ctx_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/extensions_cert.pem"
++      private_key:
++        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/extensions_key.pem"
++)EOF";
++
++  const std::string server_ctx_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/extensions_cert.pem"
++      private_key:
++        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/extensions_key.pem"
++    validation_context:
++      trusted_ca:
++        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
++  require_client_certificate: true
++)EOF";
++
++  TestUtilOptions test_options(client_ctx_yaml, server_ctx_yaml, true, GetParam());
++  testUtil(test_options.addExpected509Extension("1.2.3.4.5.6.7.8", absl::make_optional("Something"))
++               .addExpected509Extension("1.2.3.4.5.6.7.9", "\x1\x1\xFF")
++               .addExpected509Extension("1.2.3.4", absl::nullopt)
++               .setExpectedSerialNumber(TEST_EXTENSIONS_CERT_SERIAL));
++}
++
+ // By default, expired certificates are not permitted.
+ TEST_P(SslSocketTest, FailedClientCertificateDefaultExpirationVerification) {
+   envoy::config::listener::v3::Listener listener;
+@@ -1398,7 +1460,7 @@ TEST_P(SslSocketTest, FailedClientCertificateDefaultExpirationVerification) {
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedClientCertUri("spiffe://lyft.com/test-team")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert certificate expired"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_CERTIFICATE_EXPIRED"));
+ }
+ 
+ // Expired certificates will not be accepted when explicitly disallowed via
+@@ -1417,7 +1479,7 @@ TEST_P(SslSocketTest, FailedClientCertificateExpirationVerification) {
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedClientCertUri("spiffe://lyft.com/test-team")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert certificate expired"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_CERTIFICATE_EXPIRED"));
+ }
+ 
+ // Expired certificates will be accepted when explicitly allowed via allow_expired_certificate.
+@@ -1435,7 +1497,7 @@ TEST_P(SslSocketTest, ClientCertificateExpirationAllowedVerification) {
+ 
+   TestUtilOptionsV2 test_options(listener, client, true, GetParam());
+   testUtilV2(test_options.setExpectedClientCertUri("spiffe://lyft.com/test-team")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert certificate expired"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_CERTIFICATE_EXPIRED"));
+ }
+ 
+ // Allow expired certificates, but add a certificate hash requirement so it still fails.
+@@ -1458,7 +1520,7 @@ TEST_P(SslSocketTest, FailedClientCertAllowExpiredBadHashVerification) {
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_cert_hash")
+                  .setExpectedClientCertUri("spiffe://lyft.com/test-team")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert certificate expired"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_CERTIFICATE_EXPIRED"));
+ }
+ 
+ // Allow expired certificates, but use the wrong CA so it should fail still.
+@@ -1482,7 +1544,7 @@ TEST_P(SslSocketTest, FailedClientCertAllowServerExpiredWrongCAVerification) {
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedClientCertUri("spiffe://lyft.com/test-team")
+-                 .setExpectedTransportFailureReasonContains("tlsv1 alert unknown ca"));
++                 .setExpectedTransportFailureReasonContains("TLSV1_ALERT_UNKNOWN_CA"));
+ }
+ 
+ TEST_P(SslSocketTest, ClientCertificateHashVerification) {
+@@ -1878,7 +1940,7 @@ TEST_P(SslSocketTest, FailedClientCertificateSpkiVerificationNoClientCertificate
+   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext client;
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_no_cert")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert handshake failure"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_HANDSHAKE_FAILURE"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -1907,7 +1969,7 @@ TEST_P(SslSocketTest, FailedClientCertificateSpkiVerificationNoCANoClientCertifi
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_no_cert")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert handshake failure"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_HANDSHAKE_FAILURE"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -1944,7 +2006,7 @@ TEST_P(SslSocketTest, FailedClientCertificateSpkiVerificationWrongClientCertific
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_cert_hash")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert certificate unknown"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_CERTIFICATE_UNKNOWN"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -1979,7 +2041,7 @@ TEST_P(SslSocketTest, FailedClientCertificateSpkiVerificationNoCAWrongClientCert
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_cert_hash")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert certificate unknown"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_CERTIFICATE_UNKNOWN"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -2015,7 +2077,7 @@ TEST_P(SslSocketTest, FailedClientCertificateSpkiVerificationWrongCA) {
+       "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/san_uri_key.pem"));
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+-  testUtilV2(test_options.setExpectedTransportFailureReasonContains("tlsv1 alert unknown ca"));
++  testUtilV2(test_options.setExpectedTransportFailureReasonContains("TLSV1_ALERT_UNKNOWN_CA"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -2123,7 +2185,7 @@ TEST_P(SslSocketTest, FailedClientCertificateHashAndSpkiVerificationNoClientCert
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_no_cert")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert handshake failure"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_HANDSHAKE_FAILURE"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -2153,7 +2215,7 @@ TEST_P(SslSocketTest, FailedClientCertificateHashAndSpkiVerificationNoCANoClient
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_no_cert")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert handshake failure"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_HANDSHAKE_FAILURE"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -2191,7 +2253,7 @@ TEST_P(SslSocketTest, FailedClientCertificateHashAndSpkiVerificationWrongClientC
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_cert_hash")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert certificate unknown"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_CERTIFICATE_UNKNOWN"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -2227,7 +2289,7 @@ TEST_P(SslSocketTest, FailedClientCertificateHashAndSpkiVerificationNoCAWrongCli
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+   testUtilV2(test_options.setExpectedServerStats("ssl.fail_verify_cert_hash")
+-                 .setExpectedTransportFailureReasonContains("sslv3 alert certificate unknown"));
++                 .setExpectedTransportFailureReasonContains("SSLV3_ALERT_CERTIFICATE_UNKNOWN"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -2264,7 +2326,7 @@ TEST_P(SslSocketTest, FailedClientCertificateHashAndSpkiVerificationWrongCA) {
+       "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/san_uri_key.pem"));
+ 
+   TestUtilOptionsV2 test_options(listener, client, false, GetParam());
+-  testUtilV2(test_options.setExpectedTransportFailureReasonContains("tlsv1 alert unknown ca"));
++  testUtilV2(test_options.setExpectedTransportFailureReasonContains("TLSV1_ALERT_UNKNOWN_CA"));
+ 
+   // Fails even with client renegotiation.
+   client.set_allow_renegotiation(true);
+@@ -2290,7 +2352,7 @@ TEST_P(SslSocketTest, FlushCloseDuringHandshake) {
+   TestUtility::loadFromYaml(TestEnvironment::substitute(server_ctx_yaml), tls_context);
+   auto server_cfg = std::make_unique<ServerContextConfigImpl>(tls_context, factory_context_);
+   ContextManagerImpl manager(time_system_);
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   ServerSslSocketFactory server_ssl_socket_factory(std::move(server_cfg), manager,
+                                                    server_stats_store, std::vector<std::string>{});
+ 
+@@ -2312,7 +2374,8 @@ TEST_P(SslSocketTest, FlushCloseDuringHandshake) {
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection = dispatcher_->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info_);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+         Buffer::OwnedImpl data("hello");
+         server_connection->write(data, false);
+@@ -2345,7 +2408,7 @@ TEST_P(SslSocketTest, HalfClose) {
+   TestUtility::loadFromYaml(TestEnvironment::substitute(server_ctx_yaml), server_tls_context);
+   auto server_cfg = std::make_unique<ServerContextConfigImpl>(server_tls_context, factory_context_);
+   ContextManagerImpl manager(time_system_);
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   ServerSslSocketFactory server_ssl_socket_factory(std::move(server_cfg), manager,
+                                                    server_stats_store, std::vector<std::string>{});
+ 
+@@ -2364,7 +2427,7 @@ TEST_P(SslSocketTest, HalfClose) {
+   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
+   TestUtility::loadFromYaml(TestEnvironment::substitute(client_ctx_yaml), tls_context);
+   auto client_cfg = std::make_unique<ClientContextConfigImpl>(tls_context, factory_context_);
+-  Stats::IsolatedStoreImpl client_stats_store;
++  Stats::TestUtil::TestStore client_stats_store;
+   ClientSslSocketFactory client_ssl_socket_factory(std::move(client_cfg), manager,
+                                                    client_stats_store);
+   Network::ClientConnectionPtr client_connection = dispatcher_->createClientConnection(
+@@ -2381,7 +2444,8 @@ TEST_P(SslSocketTest, HalfClose) {
+   EXPECT_CALL(listener_callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection = dispatcher_->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info_);
+         server_connection->enableHalfClose(true);
+         server_connection->addReadFilter(server_read_filter);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+@@ -2426,7 +2490,7 @@ TEST_P(SslSocketTest, ClientAuthMultipleCAs) {
+   TestUtility::loadFromYaml(TestEnvironment::substitute(server_ctx_yaml), server_tls_context);
+   auto server_cfg = std::make_unique<ServerContextConfigImpl>(server_tls_context, factory_context_);
+   ContextManagerImpl manager(time_system_);
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   ServerSslSocketFactory server_ssl_socket_factory(std::move(server_cfg), manager,
+                                                    server_stats_store, std::vector<std::string>{});
+ 
+@@ -2448,7 +2512,7 @@ TEST_P(SslSocketTest, ClientAuthMultipleCAs) {
+   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
+   TestUtility::loadFromYaml(TestEnvironment::substitute(client_ctx_yaml), tls_context);
+   auto client_cfg = std::make_unique<ClientContextConfigImpl>(tls_context, factory_context_);
+-  Stats::IsolatedStoreImpl client_stats_store;
++  Stats::TestUtil::TestStore client_stats_store;
+   ClientSslSocketFactory ssl_socket_factory(std::move(client_cfg), manager, client_stats_store);
+   Network::ClientConnectionPtr client_connection = dispatcher_->createClientConnection(
+       socket->localAddress(), Network::Address::InstanceConstSharedPtr(),
+@@ -2474,7 +2538,8 @@ TEST_P(SslSocketTest, ClientAuthMultipleCAs) {
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection = dispatcher_->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info_);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+ 
+@@ -2504,7 +2569,7 @@ void testTicketSessionResumption(const std::string& server_ctx_yaml1,
+   Event::SimulatedTimeSystem time_system;
+   ContextManagerImpl manager(*time_system);
+ 
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   Api::ApiPtr server_api = Api::createApiForTest(server_stats_store, time_system);
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
+       server_factory_context;
+@@ -2537,7 +2602,7 @@ void testTicketSessionResumption(const std::string& server_ctx_yaml1,
+   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext client_tls_context;
+   TestUtility::loadFromYaml(TestEnvironment::substitute(client_ctx_yaml), client_tls_context);
+ 
+-  Stats::IsolatedStoreImpl client_stats_store;
++  Stats::TestUtil::TestStore client_stats_store;
+   Api::ApiPtr client_api = Api::createApiForTest(client_stats_store, time_system);
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
+       client_factory_context;
+@@ -2556,13 +2621,14 @@ void testTicketSessionResumption(const std::string& server_ctx_yaml1,
+ 
+   SSL_SESSION* ssl_session = nullptr;
+   Network::ConnectionPtr server_connection;
++  StreamInfo::StreamInfoImpl stream_info(time_system);
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         Network::TransportSocketFactory& tsf = socket->localAddress() == socket1->localAddress()
+                                                    ? server_ssl_socket_factory1
+                                                    : server_ssl_socket_factory2;
+-        server_connection = dispatcher->createServerConnection(std::move(socket),
+-                                                               tsf.createTransportSocket(nullptr));
++        server_connection = dispatcher->createServerConnection(
++            std::move(socket), tsf.createTransportSocket(nullptr), stream_info);
+       }));
+ 
+   EXPECT_CALL(client_connection_callbacks, onEvent(Network::ConnectionEvent::Connected))
+@@ -2598,13 +2664,14 @@ void testTicketSessionResumption(const std::string& server_ctx_yaml1,
+   client_connection->connect();
+ 
+   Network::MockConnectionCallbacks server_connection_callbacks;
++  StreamInfo::StreamInfoImpl stream_info2(time_system);
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         Network::TransportSocketFactory& tsf = socket->localAddress() == socket1->localAddress()
+                                                    ? server_ssl_socket_factory1
+                                                    : server_ssl_socket_factory2;
+-        server_connection = dispatcher->createServerConnection(std::move(socket),
+-                                                               tsf.createTransportSocket(nullptr));
++        server_connection = dispatcher->createServerConnection(
++            std::move(socket), tsf.createTransportSocket(nullptr), stream_info2);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+ 
+@@ -2640,6 +2707,83 @@ void testTicketSessionResumption(const std::string& server_ctx_yaml1,
+   EXPECT_EQ(expect_reuse ? 1UL : 0UL, client_stats_store.counter("ssl.session_reused").value());
+ }
+ 
++void testSupportForStatelessSessionResumption(const std::string& server_ctx_yaml,
++                                              const std::string& client_ctx_yaml,
++                                              bool expect_support,
++                                              const Network::Address::IpVersion ip_version) {
++  Event::SimulatedTimeSystem time_system;
++  ContextManagerImpl manager(*time_system);
++
++  Stats::IsolatedStoreImpl server_stats_store;
++  Api::ApiPtr server_api = Api::createApiForTest(server_stats_store, time_system);
++  testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
++      server_factory_context;
++  ON_CALL(server_factory_context, api()).WillByDefault(ReturnRef(*server_api));
++
++  envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext server_tls_context;
++  TestUtility::loadFromYaml(TestEnvironment::substitute(server_ctx_yaml), server_tls_context);
++  auto server_cfg =
++      std::make_unique<ServerContextConfigImpl>(server_tls_context, server_factory_context);
++
++  ServerSslSocketFactory server_ssl_socket_factory(std::move(server_cfg), manager,
++                                                   server_stats_store, {});
++  auto tcp_socket = std::make_shared<Network::TcpListenSocket>(
++      Network::Test::getCanonicalLoopbackAddress(ip_version), nullptr, true);
++  NiceMock<Network::MockListenerCallbacks> callbacks;
++  Network::MockConnectionHandler connection_handler;
++  Event::DispatcherPtr dispatcher(server_api->allocateDispatcher());
++  Network::ListenerPtr listener = dispatcher->createListener(tcp_socket, callbacks, true);
++
++  envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext client_tls_context;
++  TestUtility::loadFromYaml(TestEnvironment::substitute(client_ctx_yaml), client_tls_context);
++
++  Stats::IsolatedStoreImpl client_stats_store;
++  Api::ApiPtr client_api = Api::createApiForTest(client_stats_store, time_system);
++  testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
++      client_factory_context;
++  ON_CALL(client_factory_context, api()).WillByDefault(ReturnRef(*client_api));
++
++  auto client_cfg =
++      std::make_unique<ClientContextConfigImpl>(client_tls_context, client_factory_context);
++  ClientSslSocketFactory ssl_socket_factory(std::move(client_cfg), manager, client_stats_store);
++  Network::ClientConnectionPtr client_connection = dispatcher->createClientConnection(
++      tcp_socket->localAddress(), Network::Address::InstanceConstSharedPtr(),
++      ssl_socket_factory.createTransportSocket(nullptr), nullptr);
++
++  Network::MockConnectionCallbacks client_connection_callbacks;
++  client_connection->addConnectionCallbacks(client_connection_callbacks);
++  client_connection->connect();
++
++  StreamInfo::StreamInfoImpl stream_info(time_system);
++  Network::ConnectionPtr server_connection;
++  EXPECT_CALL(callbacks, onAccept_(_))
++      .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
++        server_connection = dispatcher->createServerConnection(
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info);
++
++        const SslSocketInfo* ssl_socket =
++            dynamic_cast<const SslSocketInfo*>(server_connection->ssl().get());
++        SSL* server_ssl_socket = ssl_socket->rawSslForTest();
++        SSL_CTX* server_ssl_context = SSL_get_SSL_CTX(server_ssl_socket);
++        if (expect_support) {
++          EXPECT_EQ(0, (SSL_CTX_get_options(server_ssl_context) & SSL_OP_NO_TICKET));
++        } else {
++          EXPECT_EQ(SSL_OP_NO_TICKET, (SSL_CTX_get_options(server_ssl_context) & SSL_OP_NO_TICKET));
++        }
++      }));
++
++  EXPECT_CALL(client_connection_callbacks, onEvent(Network::ConnectionEvent::Connected))
++      .WillOnce(Invoke([&](Network::ConnectionEvent) -> void {
++        client_connection->close(Network::ConnectionCloseType::NoFlush);
++        server_connection->close(Network::ConnectionCloseType::NoFlush);
++        dispatcher->exit();
++      }));
++
++  EXPECT_CALL(client_connection_callbacks, onEvent(Network::ConnectionEvent::LocalClose));
++  dispatcher->run(Event::Dispatcher::RunType::Block);
++}
++
+ } // namespace
+ 
+ TEST_P(SslSocketTest, TicketSessionResumption) {
+@@ -2926,6 +3070,59 @@ TEST_P(SslSocketTest, TicketSessionResumptionDifferentServerCertDifferentSAN) {
+                               GetParam());
+ }
+ 
++TEST_P(SslSocketTest, StatelessSessionResumptionDisabled) {
++  const std::string server_ctx_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_tmpdir }}/unittestcert.pem"
++      private_key:
++        filename: "{{ test_tmpdir }}/unittestkey.pem"
++  disable_stateless_session_resumption: true
++)EOF";
++
++  const std::string client_ctx_yaml = R"EOF(
++    common_tls_context:
++  )EOF";
++
++  testSupportForStatelessSessionResumption(server_ctx_yaml, client_ctx_yaml, false, GetParam());
++}
++
++TEST_P(SslSocketTest, SatelessSessionResumptionEnabledExplicitly) {
++  const std::string server_ctx_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_tmpdir }}/unittestcert.pem"
++      private_key:
++        filename: "{{ test_tmpdir }}/unittestkey.pem"
++  disable_stateless_session_resumption: false
++)EOF";
++
++  const std::string client_ctx_yaml = R"EOF(
++    common_tls_context:
++  )EOF";
++
++  testSupportForStatelessSessionResumption(server_ctx_yaml, client_ctx_yaml, true, GetParam());
++}
++
++TEST_P(SslSocketTest, StatelessSessionResumptionEnabledByDefault) {
++  const std::string server_ctx_yaml = R"EOF(
++  common_tls_context:
++    tls_certificates:
++      certificate_chain:
++        filename: "{{ test_tmpdir }}/unittestcert.pem"
++      private_key:
++        filename: "{{ test_tmpdir }}/unittestkey.pem"
++)EOF";
++
++  const std::string client_ctx_yaml = R"EOF(
++    common_tls_context:
++  )EOF";
++
++  testSupportForStatelessSessionResumption(server_ctx_yaml, client_ctx_yaml, true, GetParam());
++}
++
+ // Test that if two listeners use the same cert and session ticket key, but
+ // different client CA, that sessions cannot be resumed.
+ TEST_P(SslSocketTest, ClientAuthCrossListenerSessionResumption) {
+@@ -2965,7 +3162,7 @@ TEST_P(SslSocketTest, ClientAuthCrossListenerSessionResumption) {
+   TestUtility::loadFromYaml(TestEnvironment::substitute(server2_ctx_yaml), tls_context2);
+   auto server2_cfg = std::make_unique<ServerContextConfigImpl>(tls_context2, factory_context_);
+   ContextManagerImpl manager(time_system_);
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   ServerSslSocketFactory server_ssl_socket_factory(std::move(server_cfg), manager,
+                                                    server_stats_store, std::vector<std::string>{});
+   ServerSslSocketFactory server2_ssl_socket_factory(std::move(server2_cfg), manager,
+@@ -2992,7 +3189,7 @@ TEST_P(SslSocketTest, ClientAuthCrossListenerSessionResumption) {
+   TestUtility::loadFromYaml(TestEnvironment::substitute(client_ctx_yaml), tls_context);
+ 
+   auto client_cfg = std::make_unique<ClientContextConfigImpl>(tls_context, factory_context_);
+-  Stats::IsolatedStoreImpl client_stats_store;
++  Stats::TestUtil::TestStore client_stats_store;
+   ClientSslSocketFactory ssl_socket_factory(std::move(client_cfg), manager, client_stats_store);
+   Network::ClientConnectionPtr client_connection = dispatcher_->createClientConnection(
+       socket->localAddress(), Network::Address::InstanceConstSharedPtr(),
+@@ -3010,8 +3207,8 @@ TEST_P(SslSocketTest, ClientAuthCrossListenerSessionResumption) {
+         Network::TransportSocketFactory& tsf =
+             accepted_socket->localAddress() == socket->localAddress() ? server_ssl_socket_factory
+                                                                       : server2_ssl_socket_factory;
+-        server_connection = dispatcher_->createServerConnection(std::move(accepted_socket),
+-                                                                tsf.createTransportSocket(nullptr));
++        server_connection = dispatcher_->createServerConnection(
++            std::move(accepted_socket), tsf.createTransportSocket(nullptr), stream_info_);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+ 
+@@ -3050,8 +3247,8 @@ TEST_P(SslSocketTest, ClientAuthCrossListenerSessionResumption) {
+         Network::TransportSocketFactory& tsf =
+             accepted_socket->localAddress() == socket->localAddress() ? server_ssl_socket_factory
+                                                                       : server2_ssl_socket_factory;
+-        server_connection = dispatcher_->createServerConnection(std::move(accepted_socket),
+-                                                                tsf.createTransportSocket(nullptr));
++        server_connection = dispatcher_->createServerConnection(
++            std::move(accepted_socket), tsf.createTransportSocket(nullptr), stream_info_);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+   EXPECT_CALL(server_connection_callbacks, onEvent(Network::ConnectionEvent::RemoteClose));
+@@ -3073,7 +3270,7 @@ void SslSocketTest::testClientSessionResumption(const std::string& server_ctx_ya
+ 
+   ContextManagerImpl manager(time_system_);
+ 
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   Api::ApiPtr server_api = Api::createApiForTest(server_stats_store, time_system_);
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
+       server_factory_context;
+@@ -3100,7 +3297,7 @@ void SslSocketTest::testClientSessionResumption(const std::string& server_ctx_ya
+   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext client_ctx_proto;
+   TestUtility::loadFromYaml(TestEnvironment::substitute(client_ctx_yaml), client_ctx_proto);
+ 
+-  Stats::IsolatedStoreImpl client_stats_store;
++  Stats::TestUtil::TestStore client_stats_store;
+   Api::ApiPtr client_api = Api::createApiForTest(client_stats_store, time_system_);
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext>
+       client_factory_context;
+@@ -3136,7 +3333,8 @@ void SslSocketTest::testClientSessionResumption(const std::string& server_ctx_ya
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection = dispatcher->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info_);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+ 
+@@ -3181,7 +3379,8 @@ void SslSocketTest::testClientSessionResumption(const std::string& server_ctx_ya
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection = dispatcher->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info_);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+ 
+@@ -3342,7 +3541,7 @@ TEST_P(SslSocketTest, SslError) {
+   TestUtility::loadFromYaml(TestEnvironment::substitute(server_ctx_yaml), tls_context);
+   auto server_cfg = std::make_unique<ServerContextConfigImpl>(tls_context, factory_context_);
+   ContextManagerImpl manager(time_system_);
+-  Stats::IsolatedStoreImpl server_stats_store;
++  Stats::TestUtil::TestStore server_stats_store;
+   ServerSslSocketFactory server_ssl_socket_factory(std::move(server_cfg), manager,
+                                                    server_stats_store, std::vector<std::string>{});
+ 
+@@ -3364,7 +3563,8 @@ TEST_P(SslSocketTest, SslError) {
+   EXPECT_CALL(callbacks, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection = dispatcher_->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory.createTransportSocket(nullptr),
++            stream_info_);
+         server_connection->addConnectionCallbacks(server_connection_callbacks);
+       }));
+ 
+@@ -3460,7 +3660,7 @@ TEST_P(SslSocketTest, ProtocolVersions) {
+       createProtocolTestOptions(listener, client, GetParam(), "TLSv1.3");
+   TestUtilOptionsV2 error_test_options(listener, client, false, GetParam());
+   error_test_options.setExpectedServerStats("ssl.connection_error")
+-      .setExpectedTransportFailureReasonContains("tlsv1 alert protocol version");
++      .setExpectedTransportFailureReasonContains("TLSV1_ALERT_PROTOCOL_VERSION");
+ #ifndef BORINGSSL_FIPS
+   testUtilV2(tls_v1_3_test_options);
+ #else // BoringSSL FIPS
+@@ -3514,7 +3714,7 @@ TEST_P(SslSocketTest, ProtocolVersions) {
+ 
+   TestUtilOptionsV2 unsupported_protocol_test_options(listener, client, false, GetParam());
+   unsupported_protocol_test_options.setExpectedServerStats("ssl.connection_error")
+-      .setExpectedTransportFailureReasonContains("unsupported protocol");
++      .setExpectedTransportFailureReasonContains("UNSUPPORTED_PROTOCOL");
+ 
+   // Connection using defaults (client) and TLSv1.0 (server) fails.
+   server_params->set_tls_minimum_protocol_version(
+@@ -4022,12 +4222,12 @@ TEST_P(SslSocketTest, OverrideApplicationProtocols) {
+ // Validate that if downstream secrets are not yet downloaded from SDS server, Envoy creates
+ // NotReadySslSocket object to handle downstream connection.
+ TEST_P(SslSocketTest, DownstreamNotReadySslSocket) {
+-  Stats::IsolatedStoreImpl stats_store;
++  Stats::TestUtil::TestStore stats_store;
+   NiceMock<LocalInfo::MockLocalInfo> local_info;
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext> factory_context;
+   NiceMock<Init::MockManager> init_manager;
+   NiceMock<Event::MockDispatcher> dispatcher;
+-  EXPECT_CALL(factory_context, dispatcher()).WillOnce(ReturnRef(dispatcher));
++  EXPECT_CALL(factory_context, dispatcher()).WillRepeatedly(ReturnRef(dispatcher));
+   EXPECT_CALL(factory_context, localInfo()).WillOnce(ReturnRef(local_info));
+   EXPECT_CALL(factory_context, stats()).WillOnce(ReturnRef(stats_store));
+   EXPECT_CALL(factory_context, initManager()).WillRepeatedly(Return(&init_manager));
+@@ -4058,7 +4258,7 @@ TEST_P(SslSocketTest, DownstreamNotReadySslSocket) {
+ // Validate that if upstream secrets are not yet downloaded from SDS server, Envoy creates
+ // NotReadySslSocket object to handle upstream connection.
+ TEST_P(SslSocketTest, UpstreamNotReadySslSocket) {
+-  Stats::IsolatedStoreImpl stats_store;
++  Stats::TestUtil::TestStore stats_store;
+   NiceMock<LocalInfo::MockLocalInfo> local_info;
+   testing::NiceMock<Server::Configuration::MockTransportSocketFactoryContext> factory_context;
+   NiceMock<Init::MockManager> init_manager;
+@@ -4066,7 +4266,7 @@ TEST_P(SslSocketTest, UpstreamNotReadySslSocket) {
+   EXPECT_CALL(factory_context, localInfo()).WillOnce(ReturnRef(local_info));
+   EXPECT_CALL(factory_context, stats()).WillOnce(ReturnRef(stats_store));
+   EXPECT_CALL(factory_context, initManager()).WillRepeatedly(Return(&init_manager));
+-  EXPECT_CALL(factory_context, dispatcher()).WillOnce(ReturnRef(dispatcher));
++  EXPECT_CALL(factory_context, dispatcher()).WillRepeatedly(ReturnRef(dispatcher));
+ 
+   envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
+   auto sds_secret_configs =
+@@ -4117,7 +4317,7 @@ protected:
+         socket_->localAddress(), source_address_, std::move(transport_socket), nullptr);
+     client_connection_->addConnectionCallbacks(client_callbacks_);
+     client_connection_->connect();
+-    read_filter_.reset(new Network::MockReadFilter());
++    read_filter_ = std::make_shared<Network::MockReadFilter>();
+   }
+ 
+   void readBufferLimitTest(uint32_t read_buffer_limit, uint32_t expected_chunk_size,
+@@ -4127,7 +4327,8 @@ protected:
+     EXPECT_CALL(listener_callbacks_, onAccept_(_))
+         .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+           server_connection_ = dispatcher_->createServerConnection(
+-              std::move(socket), server_ssl_socket_factory_->createTransportSocket(nullptr));
++              std::move(socket), server_ssl_socket_factory_->createTransportSocket(nullptr),
++              stream_info_);
+           server_connection_->setBufferLimits(read_buffer_limit);
+           server_connection_->addConnectionCallbacks(server_callbacks_);
+           server_connection_->addReadFilter(read_filter_);
+@@ -4206,7 +4407,8 @@ protected:
+     EXPECT_CALL(listener_callbacks_, onAccept_(_))
+         .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+           server_connection_ = dispatcher_->createServerConnection(
+-              std::move(socket), server_ssl_socket_factory_->createTransportSocket(nullptr));
++              std::move(socket), server_ssl_socket_factory_->createTransportSocket(nullptr),
++              stream_info_);
+           server_connection_->setBufferLimits(read_buffer_limit);
+           server_connection_->addConnectionCallbacks(server_callbacks_);
+           server_connection_->addReadFilter(read_filter_);
+@@ -4245,8 +4447,8 @@ protected:
+     dispatcher_->run(Event::Dispatcher::RunType::Block);
+   }
+ 
+-  Stats::IsolatedStoreImpl server_stats_store_;
+-  Stats::IsolatedStoreImpl client_stats_store_;
++  Stats::TestUtil::TestStore server_stats_store_;
++  Stats::TestUtil::TestStore client_stats_store_;
+   std::shared_ptr<Network::TcpListenSocket> socket_;
+   Network::MockListenerCallbacks listener_callbacks_;
+   Network::MockConnectionHandler connection_handler_;
+@@ -4325,7 +4527,8 @@ TEST_P(SslReadBufferLimitTest, TestBind) {
+   EXPECT_CALL(listener_callbacks_, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection_ = dispatcher_->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory_->createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory_->createTransportSocket(nullptr),
++            stream_info_);
+         server_connection_->addConnectionCallbacks(server_callbacks_);
+         server_connection_->addReadFilter(read_filter_);
+         EXPECT_EQ("", server_connection_->nextProtocol());
+@@ -4354,7 +4557,8 @@ TEST_P(SslReadBufferLimitTest, SmallReadsIntoSameSlice) {
+   EXPECT_CALL(listener_callbacks_, onAccept_(_))
+       .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+         server_connection_ = dispatcher_->createServerConnection(
+-            std::move(socket), server_ssl_socket_factory_->createTransportSocket(nullptr));
++            std::move(socket), server_ssl_socket_factory_->createTransportSocket(nullptr),
++            stream_info_);
+         server_connection_->setBufferLimits(read_buffer_limit);
+         server_connection_->addConnectionCallbacks(server_callbacks_);
+         server_connection_->addReadFilter(read_filter_);
+@@ -4372,7 +4576,7 @@ TEST_P(SslReadBufferLimitTest, SmallReadsIntoSameSlice) {
+   EXPECT_CALL(*read_filter_, onData(_, _))
+       .WillRepeatedly(Invoke([&](Buffer::Instance& data, bool) -> Network::FilterStatus {
+         EXPECT_GE(expected_chunk_size, data.length());
+-        EXPECT_EQ(1, data.getRawSlices(nullptr, 0));
++        EXPECT_EQ(1, data.getRawSlices().size());
+         filter_seen += data.length();
+         data.drain(data.length());
+         if (filter_seen == (write_size * num_writes)) {
+@@ -4521,49 +4725,22 @@ ENGINE* newFakeAsyncEngine(RSA_METHOD** rsaMethod) {
+   return e;
+ }
+ 
+-// Test signing with an asynchronous engine.
+-TEST_P(SslSocketTest, AsyncRSASuccess) {
+-  RSA_METHOD* fakeRsaMethod = nullptr;
++// Test asynchronous signing (ECDHE) using a private key provider.
++TEST_P(SslSocketTest, RsaPrivateKeyProviderAsyncSignSuccess) {
+   const std::string server_ctx_yaml = R"EOF(
+   common_tls_context:
+     tls_certificates:
+       certificate_chain:
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+-      private_key:
+-        filename: "{{ test_tmpdir }}/unittestkey.pem"
+-    validation_context:
+-      trusted_ca:
+-        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+-      crl:
+-        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.crl"
+-)EOF";
+-  const std::string successful_client_ctx_yaml = R"EOF(
+-  common_tls_context:
+-)EOF";
+-  ENGINE* engine = newFakeAsyncEngine(&fakeRsaMethod);
+-  ASSERT_FALSE(engine == nullptr);
+-  ASSERT_FALSE(fakeRsaMethod == nullptr);
+-  ASSERT_TRUE(ENGINE_init(engine));
+-  ASSERT_TRUE(ENGINE_set_default_RSA(engine));
+-  TestUtilOptions successful_test_options(successful_client_ctx_yaml, server_ctx_yaml, true,
+-                                          GetParam());
+-  testUtil(successful_test_options);
+-  ENGINE_unregister_RSA(engine);
+-  ASSERT_TRUE(ENGINE_finish(engine));
+-  ASSERT_TRUE(ENGINE_free(engine));
+-  RSA_meth_free(fakeRsaMethod);
+-}
+-
+-// Test we handle async handshake errors gracefully in SslSocket::asyncCb().
+-TEST_P(SslSocketTest, AsyncIncompleteHandshake) {
+-  RSA_METHOD* fakeRsaMethod = nullptr;
+-  const std::string server_ctx_yaml = R"EOF(
+-  common_tls_context:
+-    tls_certificates:
+-      certificate_chain:
+-        filename: "{{ test_tmpdir }}/unittestcert.pem"
+-      private_key:
+-        filename: "{{ test_tmpdir }}/unittestkey.pem"
++      private_key_provider:
++        provider_name: test
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            sync_mode: false
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4572,59 +4749,16 @@ TEST_P(SslSocketTest, AsyncIncompleteHandshake) {
+ )EOF";
+   const std::string successful_client_ctx_yaml = R"EOF(
+   common_tls_context:
++    tls_params:
++      cipher_suites:
++      - ECDHE-RSA-AES128-GCM-SHA256
+ )EOF";
+-  ENGINE* engine = newFakeAsyncEngine(&fakeRsaMethod);
+-  ASSERT_FALSE(engine == nullptr);
+-  ASSERT_FALSE(fakeRsaMethod == nullptr);
+-  ASSERT_TRUE(ENGINE_init(engine));
+-  ASSERT_TRUE(ENGINE_set_default_RSA(engine));
+-  TestUtilOptions successful_test_options(successful_client_ctx_yaml, server_ctx_yaml, false,
+-                                          GetParam());
+-  failRsaModExp = true;
+-  testUtil(successful_test_options.setExpectedServerCloseEvent(Network::ConnectionEvent::LocalClose)
+-               .setExpectedServerStats("ssl.fail_async_handshake_error"));
+-  ENGINE_unregister_RSA(engine);
+-  ASSERT_TRUE(ENGINE_finish(engine));
+-  ASSERT_TRUE(ENGINE_free(engine));
+-  RSA_meth_free(fakeRsaMethod);
+-}
+ 
+-// Test we don't free struct SSL while it's still held by the async engine.
+-TEST_P(SslSocketTest, AsyncPrematureDisconnect) {
+-  RSA_METHOD* fakeRsaMethod = nullptr;
+-  const std::string server_ctx_yaml = R"EOF(
+-  common_tls_context:
+-    tls_certificates:
+-      certificate_chain:
+-        filename: "{{ test_tmpdir }}/unittestcert.pem"
+-      private_key:
+-        filename: "{{ test_tmpdir }}/unittestkey.pem"
+-    validation_context:
+-      trusted_ca:
+-        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+-      crl:
+-        filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.crl"
+-)EOF";
+-  const std::string successful_client_ctx_yaml = R"EOF(
+-  common_tls_context:
+-)EOF";
+-  ENGINE* engine = newFakeAsyncEngine(&fakeRsaMethod);
+-  ASSERT_FALSE(engine == nullptr);
+-  ASSERT_FALSE(fakeRsaMethod == nullptr);
+-  ASSERT_TRUE(ENGINE_init(engine));
+-  ASSERT_TRUE(ENGINE_set_default_RSA(engine));
+-  TestUtilOptions successful_test_options(successful_client_ctx_yaml, server_ctx_yaml, false,
++  TestUtilOptions successful_test_options(successful_client_ctx_yaml, server_ctx_yaml, true,
+                                           GetParam());
+-  isPrematureDisconnect = true;
+-  testUtil(successful_test_options.setExpectPrematureDisconnect().setExpectedServerStats(
+-      "ssl.fail_async_premature_disconnect"));
+-  ENGINE_unregister_RSA(engine);
+-  ASSERT_TRUE(ENGINE_finish(engine));
+-  ASSERT_TRUE(ENGINE_free(engine));
+-  RSA_meth_free(fakeRsaMethod);
++  testUtil(successful_test_options.setPrivateKeyMethodExpected(true));
+ }
+ 
+-/*
+ // Test asynchronous decryption (RSA).
+ TEST_P(SslSocketTest, RsaPrivateKeyProviderAsyncDecryptSuccess) {
+   const std::string server_ctx_yaml = R"EOF(
+@@ -4634,11 +4768,13 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderAsyncDecryptSuccess) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: decrypt
+-          sync_mode: false
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: decrypt
++            sync_mode: false
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4666,11 +4802,13 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderSyncSignSuccess) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          sync_mode: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            sync_mode: true
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4698,11 +4836,13 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderSyncDecryptSuccess) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: decrypt
+-          sync_mode: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: decrypt
++            sync_mode: true
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4730,12 +4870,14 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderAsyncSignFailure) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          sync_mode: false
+-          crypto_error: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            sync_mode: false
++            crypto_error: true
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4763,12 +4905,14 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderSyncSignFailure) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          sync_mode: true
+-          crypto_error: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            sync_mode: true
++            crypto_error: true
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4796,11 +4940,13 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderSignFailure) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          method_error: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            method_error: true
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4828,11 +4974,13 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderDecryptFailure) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: decrypt
+-          method_error: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: decrypt
++            method_error: true
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4860,11 +5008,13 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderAsyncSignCompleteFailure) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          async_method_error: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            async_method_error: true
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4893,11 +5043,13 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderAsyncDecryptCompleteFailure) {
+         filename: "{{ test_tmpdir }}/unittestcert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: decrypt
+-          async_method_error: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: decrypt
++            async_method_error: true
++            mode: rsa
+     validation_context:
+       trusted_ca:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/ca_cert.pem"
+@@ -4939,11 +5091,13 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderMultiCertSuccess) {
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_cert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          sync_mode: false
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            sync_mode: false
++            mode: rsa
+     - certificate_chain:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_cert.pem"
+       private_key:
+@@ -4977,20 +5131,24 @@ TEST_P(SslSocketTest, RsaPrivateKeyProviderMultiCertFail) {
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_cert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          sync_mode: false
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            sync_mode: false
++            mode: rsa
+     - certificate_chain:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_cert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_key.pem"
+-          expected_operation: sign
+-          sync_mode: false
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_key.pem"
++            expected_operation: sign
++            sync_mode: false
++            mode: rsa
+ )EOF";
+ 
+   TestUtilOptions failing_test_options(client_ctx_yaml, server_ctx_yaml, false, GetParam());
+@@ -5018,10 +5176,12 @@ TEST_P(SslSocketTest, EcdsaPrivateKeyProviderSuccess) {
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_cert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_key.pem"
+-          expected_operation: sign
+-          mode: ecdsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_key.pem"
++            expected_operation: sign
++            mode: ecdsa
+ )EOF";
+ 
+   TestUtilOptions test_options(client_ctx_yaml, server_ctx_yaml, true, GetParam());
+@@ -5051,20 +5211,24 @@ TEST_P(SslSocketTest, RsaAndEcdsaPrivateKeyProviderMultiCertSuccess) {
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_cert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          sync_mode: false
+-          async_method_error: true
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            sync_mode: false
++            async_method_error: true
++            mode: rsa
+     - certificate_chain:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_cert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_key.pem"
+-          expected_operation: sign
+-          mode: ecdsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_key.pem"
++            expected_operation: sign
++            mode: ecdsa
+ )EOF";
+   TestUtilOptions test_options(client_ctx_yaml, server_ctx_yaml, true, GetParam());
+   testUtil(test_options.setPrivateKeyMethodExpected(true));
+@@ -5091,27 +5255,30 @@ TEST_P(SslSocketTest, RsaAndEcdsaPrivateKeyProviderMultiCertFail) {
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_cert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
+-          expected_operation: sign
+-          sync_mode: false
+-          mode: rsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_tmpdir }}/unittestkey.pem"
++            expected_operation: sign
++            sync_mode: false
++            mode: rsa
+     - certificate_chain:
+         filename: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_cert.pem"
+       private_key_provider:
+         provider_name: test
+-        config:
+-          private_key_file: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_key.pem"
+-          expected_operation: sign
+-          async_method_error: true
+-          mode: ecdsa
++        typed_config:
++          "@type": type.googleapis.com/google.protobuf.Struct
++          value:
++            private_key_file: "{{ test_rundir }}/test/extensions/transport_sockets/tls/test_data/selfsigned_ecdsa_p256_key.pem"
++            expected_operation: sign
++            async_method_error: true
++            mode: ecdsa
+ )EOF";
+   TestUtilOptions failing_test_options(client_ctx_yaml, server_ctx_yaml, false, GetParam());
+   testUtil(failing_test_options.setPrivateKeyMethodExpected(true)
+                .setExpectedServerCloseEvent(Network::ConnectionEvent::LocalClose)
+                .setExpectedServerStats("ssl.connection_error"));
+ }
+-*/
+ 
+ } // namespace Tls
+ } // namespace TransportSockets
+diff --git a/test/extensions/transport_sockets/tls/test_private_key_method_provider.cc b/test/extensions/transport_sockets/tls/test_private_key_method_provider.cc
+new file mode 100644
+index 0000000..9fd3ca8
+--- /dev/null
++++ b/test/extensions/transport_sockets/tls/test_private_key_method_provider.cc
+@@ -0,0 +1,389 @@
++#include "test/extensions/transport_sockets/tls/test_private_key_method_provider.h"
++
++#include <memory>
++
++#include "envoy/api/api.h"
++
++#include "openssl/ssl.h"
++
++#include "boringssl_compat/bssl.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace PrivateKeyMethodProvider {
++
++void TestPrivateKeyConnection::delayed_op() {
++  const std::chrono::milliseconds timeout_0ms{0};
++
++  timer_ = dispatcher_.createTimer([this]() -> void {
++    finished_ = true;
++    this->cb_.onPrivateKeyMethodComplete();
++  });
++  timer_->enableTimer(timeout_0ms);
++}
++
++static int calculateDigest(const EVP_MD* md, const uint8_t* in, size_t in_len, unsigned char* hash,
++                           unsigned int* hash_len) {
++  bssl::ScopedEVP_MD_CTX ctx;
++
++  // Calculate the message digest for signing.
++  if (!EVP_DigestInit_ex(ctx.get(), md, nullptr) || !EVP_DigestUpdate(ctx.get(), in, in_len) ||
++      !EVP_DigestFinal_ex(ctx.get(), hash, hash_len)) {
++    return 0;
++  }
++  return 1;
++}
++
++static ssl_private_key_result_t ecdsaPrivateKeySign(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                    size_t max_out, uint16_t signature_algorithm,
++                                                    const uint8_t* in, size_t in_len) {
++  unsigned char hash[EVP_MAX_MD_SIZE];
++  unsigned int hash_len;
++  TestPrivateKeyConnection* ops = static_cast<TestPrivateKeyConnection*>(
++      SSL_get_ex_data(ssl, TestPrivateKeyMethodProvider::ecdsaConnectionIndex()));
++  unsigned int out_len_unsigned;
++
++  if (!ops) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.method_error_) {
++    // Have an artificial test failure.
++    return ssl_private_key_failure;
++  }
++
++  if (!ops->test_options_.sign_expected_) {
++    return ssl_private_key_failure;
++  }
++
++  const EVP_MD* md = SSL_get_signature_algorithm_digest(signature_algorithm);
++  if (!md) {
++    return ssl_private_key_failure;
++  }
++
++  if (!calculateDigest(md, in, in_len, hash, &hash_len)) {
++    return ssl_private_key_failure;
++  }
++
++  bssl::UniquePtr<EC_KEY> ec_key(EVP_PKEY_get1_EC_KEY(ops->getPrivateKey()));
++  if (!ec_key) {
++    return ssl_private_key_failure;
++  }
++
++  // Borrow "out" because it has been already initialized to the max_out size.
++  if (!ECDSA_sign(0, hash, hash_len, out, &out_len_unsigned, ec_key.get())) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.sync_mode_) {
++    // Return immediately with the results.
++    if (out_len_unsigned > max_out) {
++      return ssl_private_key_failure;
++    }
++    *out_len = out_len_unsigned;
++    return ssl_private_key_success;
++  }
++
++  ops->output_.assign(out, out + out_len_unsigned);
++  // Tell SSL socket that the operation is ready to be called again.
++  ops->delayed_op();
++
++  return ssl_private_key_retry;
++}
++
++static ssl_private_key_result_t ecdsaPrivateKeyDecrypt(SSL*, uint8_t*, size_t*, size_t,
++                                                       const uint8_t*, size_t) {
++  return ssl_private_key_failure;
++}
++
++static ssl_private_key_result_t rsaPrivateKeySign(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                  size_t max_out, uint16_t signature_algorithm,
++                                                  const uint8_t* in, size_t in_len) {
++  TestPrivateKeyConnection* ops = static_cast<TestPrivateKeyConnection*>(
++      SSL_get_ex_data(ssl, TestPrivateKeyMethodProvider::rsaConnectionIndex()));
++  unsigned char hash[EVP_MAX_MD_SIZE] = {0};
++  unsigned int hash_len = EVP_MAX_MD_SIZE;
++  std::vector<uint8_t> in2;
++
++  if (!ops) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.method_error_) {
++    return ssl_private_key_failure;
++  }
++
++  if (!ops->test_options_.sign_expected_) {
++    return ssl_private_key_failure;
++  }
++
++  const EVP_MD* md = SSL_get_signature_algorithm_digest(signature_algorithm);
++  if (!md) {
++    return ssl_private_key_failure;
++  }
++
++  in2.assign(in, in + in_len);
++
++  // If crypto error is set, we'll modify the incoming token by flipping
++  // the bits.
++  if (ops->test_options_.crypto_error_) {
++    for (size_t i = 0; i < in_len; i++) {
++      in2[i] = ~in2[i];
++    }
++  }
++
++  if (!calculateDigest(md, in2.data(), in_len, hash, &hash_len)) {
++    return ssl_private_key_failure;
++  }
++
++  RSA* rsa = EVP_PKEY_get0_RSA(ops->getPrivateKey());
++  if (rsa == nullptr) {
++    return ssl_private_key_failure;
++  }
++
++  // Perform RSA signing.
++  if (SSL_is_signature_algorithm_rsa_pss(signature_algorithm)) {
++    if (!RSA_sign_pss_mgf1(rsa, out_len, out, max_out, hash, hash_len, md, nullptr, -1)) {
++      return ssl_private_key_failure;
++    }
++  } else {
++    unsigned int out_len_unsigned;
++    if (!RSA_sign(EVP_MD_type(md), hash, hash_len, out, &out_len_unsigned, rsa)) {
++      return ssl_private_key_failure;
++    }
++    if (out_len_unsigned > max_out) {
++      return ssl_private_key_failure;
++    }
++    *out_len = out_len_unsigned;
++  }
++
++  if (ops->test_options_.sync_mode_) {
++    return ssl_private_key_success;
++  }
++
++  ops->output_.assign(out, out + *out_len);
++  ops->delayed_op();
++
++  return ssl_private_key_retry;
++}
++
++static ssl_private_key_result_t rsaPrivateKeyDecrypt(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                     size_t max_out, const uint8_t* in,
++                                                     size_t in_len) {
++  TestPrivateKeyConnection* ops = static_cast<TestPrivateKeyConnection*>(
++      SSL_get_ex_data(ssl, TestPrivateKeyMethodProvider::rsaConnectionIndex()));
++
++  if (!ops) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.method_error_) {
++    return ssl_private_key_failure;
++  }
++
++  if (!ops->test_options_.decrypt_expected_) {
++    return ssl_private_key_failure;
++  }
++
++  RSA* rsa = EVP_PKEY_get0_RSA(ops->getPrivateKey());
++  if (rsa == nullptr) {
++    return ssl_private_key_failure;
++  }
++
++  if (!RSA_decrypt(rsa, out_len, out, max_out, in, in_len, RSA_NO_PADDING)) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.sync_mode_) {
++    return ssl_private_key_success;
++  }
++
++  ops->output_.assign(out, out + *out_len);
++  ops->delayed_op();
++
++  return ssl_private_key_retry;
++}
++
++static ssl_private_key_result_t privateKeyComplete(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                   size_t max_out, int id) {
++  TestPrivateKeyConnection* ops = static_cast<TestPrivateKeyConnection*>(SSL_get_ex_data(ssl, id));
++
++  if (!ops->finished_) {
++    // The operation didn't finish yet, retry.
++    return ssl_private_key_retry;
++  }
++
++  if (ops->test_options_.async_method_error_) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->output_.size() > max_out) {
++    return ssl_private_key_failure;
++  }
++
++  std::copy(ops->output_.begin(), ops->output_.end(), out);
++  *out_len = ops->output_.size();
++
++  return ssl_private_key_success;
++}
++
++static ssl_private_key_result_t rsaPrivateKeyComplete(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                      size_t max_out) {
++  return privateKeyComplete(ssl, out, out_len, max_out,
++                            TestPrivateKeyMethodProvider::rsaConnectionIndex());
++}
++
++static ssl_private_key_result_t ecdsaPrivateKeyComplete(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                        size_t max_out) {
++  return privateKeyComplete(ssl, out, out_len, max_out,
++                            TestPrivateKeyMethodProvider::ecdsaConnectionIndex());
++}
++
++Ssl::BoringSslPrivateKeyMethodSharedPtr
++TestPrivateKeyMethodProvider::getBoringSslPrivateKeyMethod() {
++  return method_;
++}
++
++bool TestPrivateKeyMethodProvider::checkFips() {
++  if (mode_ == "rsa") {
++    RSA* rsa_private_key = EVP_PKEY_get0_RSA(pkey_.get());
++    if (rsa_private_key == nullptr || !RSA_check_fips(rsa_private_key)) {
++      return false;
++    }
++  } else { // if (mode_ == "ecdsa")
++    const EC_KEY* ecdsa_private_key = EVP_PKEY_get0_EC_KEY(pkey_.get());
++    if (ecdsa_private_key == nullptr || !EC_KEY_check_fips(ecdsa_private_key)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++TestPrivateKeyConnection::TestPrivateKeyConnection(
++    Ssl::PrivateKeyConnectionCallbacks& cb, Event::Dispatcher& dispatcher,
++    bssl::UniquePtr<EVP_PKEY> pkey, TestPrivateKeyConnectionTestOptions& test_options)
++    : test_options_(test_options), cb_(cb), dispatcher_(dispatcher), pkey_(std::move(pkey)) {}
++
++void TestPrivateKeyMethodProvider::registerPrivateKeyMethod(SSL* ssl,
++                                                            Ssl::PrivateKeyConnectionCallbacks& cb,
++                                                            Event::Dispatcher& dispatcher) {
++  TestPrivateKeyConnection* ops;
++  // In multi-cert case, when the same provider is used in different modes with the same SSL object,
++  // we need to keep both rsa and ecdsa connection objects in store because the test options for the
++  // two certificates may be different. We need to be able to deduct in the signing, decryption, and
++  // completion functions which options to use, so we associate the connection objects to the same
++  // SSL object using different user data indexes.
++  //
++  // Another way to do this would be to store both test options in one connection object.
++  int index = mode_ == "rsa" ? TestPrivateKeyMethodProvider::rsaConnectionIndex()
++                             : TestPrivateKeyMethodProvider::ecdsaConnectionIndex();
++
++  // Check if there is another certificate of the same mode associated with the context. This would
++  // be an error.
++  ops = static_cast<TestPrivateKeyConnection*>(SSL_get_ex_data(ssl, index));
++  if (ops != nullptr) {
++    throw EnvoyException(
++        "Can't distinguish between two registered providers for the same SSL object.");
++  }
++
++  ops = new TestPrivateKeyConnection(cb, dispatcher, bssl::UpRef(pkey_), test_options_);
++  SSL_set_ex_data(ssl, index, ops);
++}
++
++void TestPrivateKeyMethodProvider::unregisterPrivateKeyMethod(SSL* ssl) {
++  int index = mode_ == "rsa" ? TestPrivateKeyMethodProvider::rsaConnectionIndex()
++                             : TestPrivateKeyMethodProvider::ecdsaConnectionIndex();
++  TestPrivateKeyConnection* ops =
++      static_cast<TestPrivateKeyConnection*>(SSL_get_ex_data(ssl, index));
++  SSL_set_ex_data(ssl, index, nullptr);
++  delete ops;
++}
++
++static int createIndex() {
++  int index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
++  RELEASE_ASSERT(index >= 0, "Failed to get SSL user data index.");
++  return index;
++}
++
++int TestPrivateKeyMethodProvider::rsaConnectionIndex() {
++  CONSTRUCT_ON_FIRST_USE(int, createIndex());
++}
++
++int TestPrivateKeyMethodProvider::ecdsaConnectionIndex() {
++  CONSTRUCT_ON_FIRST_USE(int, createIndex());
++}
++
++TestPrivateKeyMethodProvider::TestPrivateKeyMethodProvider(
++    const ProtobufWkt::Any& typed_config,
++    Server::Configuration::TransportSocketFactoryContext& factory_context) {
++  std::string private_key_path;
++
++  auto config = MessageUtil::anyConvert<ProtobufWkt::Struct>(typed_config);
++
++  for (auto& value_it : config.fields()) {
++    auto& value = value_it.second;
++    if (value_it.first == "private_key_file" &&
++        value.kind_case() == ProtobufWkt::Value::kStringValue) {
++      private_key_path = value.string_value();
++    }
++    if (value_it.first == "sync_mode" && value.kind_case() == ProtobufWkt::Value::kBoolValue) {
++      test_options_.sync_mode_ = value.bool_value();
++    }
++    if (value_it.first == "crypto_error" && value.kind_case() == ProtobufWkt::Value::kBoolValue) {
++      test_options_.crypto_error_ = value.bool_value();
++    }
++    if (value_it.first == "method_error" && value.kind_case() == ProtobufWkt::Value::kBoolValue) {
++      test_options_.method_error_ = value.bool_value();
++    }
++    if (value_it.first == "async_method_error" &&
++        value.kind_case() == ProtobufWkt::Value::kBoolValue) {
++      test_options_.async_method_error_ = value.bool_value();
++    }
++    if (value_it.first == "expected_operation" &&
++        value.kind_case() == ProtobufWkt::Value::kStringValue) {
++      if (value.string_value() == "decrypt") {
++        test_options_.decrypt_expected_ = true;
++      } else if (value.string_value() == "sign") {
++        test_options_.sign_expected_ = true;
++      }
++    }
++    if (value_it.first == "mode" && value.kind_case() == ProtobufWkt::Value::kStringValue) {
++      mode_ = value.string_value();
++    }
++  }
++
++  std::string private_key = factory_context.api().fileSystem().fileReadToEnd(private_key_path);
++  bssl::UniquePtr<BIO> bio(
++      BIO_new_mem_buf(const_cast<char*>(private_key.data()), private_key.size()));
++  bssl::UniquePtr<EVP_PKEY> pkey(PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr));
++  if (pkey == nullptr) {
++    throw EnvoyException("Failed to read private key from disk.");
++  }
++
++  method_ = std::make_shared<SSL_PRIVATE_KEY_METHOD>();
++
++  // Have two modes, "rsa" and "ecdsa", for testing multi-cert use cases.
++  if (mode_ == "rsa") {
++    if (EVP_PKEY_id(pkey.get()) != EVP_PKEY_RSA) {
++      throw EnvoyException("Private key is not RSA.");
++    }
++    method_->sign = rsaPrivateKeySign;
++    method_->decrypt = rsaPrivateKeyDecrypt;
++    method_->complete = rsaPrivateKeyComplete;
++  } else if (mode_ == "ecdsa") {
++    if (EVP_PKEY_id(pkey.get()) != EVP_PKEY_EC) {
++      throw EnvoyException("Private key is not ECDSA.");
++    }
++    method_->sign = ecdsaPrivateKeySign;
++    method_->decrypt = ecdsaPrivateKeyDecrypt;
++    method_->complete = ecdsaPrivateKeyComplete;
++  } else {
++    throw EnvoyException("Unknown test provider mode, supported modes are \"rsa\" and \"ecdsa\".");
++  }
++
++  pkey_ = std::move(pkey);
++}
++
++} // namespace PrivateKeyMethodProvider
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/test/extensions/transport_sockets/tls/test_private_key_method_provider.cc~ b/test/extensions/transport_sockets/tls/test_private_key_method_provider.cc~
+new file mode 100644
+index 0000000..6cae75d
+--- /dev/null
++++ b/test/extensions/transport_sockets/tls/test_private_key_method_provider.cc~
+@@ -0,0 +1,387 @@
++#include "test/extensions/transport_sockets/tls/test_private_key_method_provider.h"
++
++#include <memory>
++
++#include "envoy/api/api.h"
++
++#include "openssl/ssl.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace PrivateKeyMethodProvider {
++
++void TestPrivateKeyConnection::delayed_op() {
++  const std::chrono::milliseconds timeout_0ms{0};
++
++  timer_ = dispatcher_.createTimer([this]() -> void {
++    finished_ = true;
++    this->cb_.onPrivateKeyMethodComplete();
++  });
++  timer_->enableTimer(timeout_0ms);
++}
++
++static int calculateDigest(const EVP_MD* md, const uint8_t* in, size_t in_len, unsigned char* hash,
++                           unsigned int* hash_len) {
++  bssl::ScopedEVP_MD_CTX ctx;
++
++  // Calculate the message digest for signing.
++  if (!EVP_DigestInit_ex(ctx.get(), md, nullptr) || !EVP_DigestUpdate(ctx.get(), in, in_len) ||
++      !EVP_DigestFinal_ex(ctx.get(), hash, hash_len)) {
++    return 0;
++  }
++  return 1;
++}
++
++static ssl_private_key_result_t ecdsaPrivateKeySign(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                    size_t max_out, uint16_t signature_algorithm,
++                                                    const uint8_t* in, size_t in_len) {
++  unsigned char hash[EVP_MAX_MD_SIZE];
++  unsigned int hash_len;
++  TestPrivateKeyConnection* ops = static_cast<TestPrivateKeyConnection*>(
++      SSL_get_ex_data(ssl, TestPrivateKeyMethodProvider::ecdsaConnectionIndex()));
++  unsigned int out_len_unsigned;
++
++  if (!ops) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.method_error_) {
++    // Have an artificial test failure.
++    return ssl_private_key_failure;
++  }
++
++  if (!ops->test_options_.sign_expected_) {
++    return ssl_private_key_failure;
++  }
++
++  const EVP_MD* md = SSL_get_signature_algorithm_digest(signature_algorithm);
++  if (!md) {
++    return ssl_private_key_failure;
++  }
++
++  if (!calculateDigest(md, in, in_len, hash, &hash_len)) {
++    return ssl_private_key_failure;
++  }
++
++  bssl::UniquePtr<EC_KEY> ec_key(EVP_PKEY_get1_EC_KEY(ops->getPrivateKey()));
++  if (!ec_key) {
++    return ssl_private_key_failure;
++  }
++
++  // Borrow "out" because it has been already initialized to the max_out size.
++  if (!ECDSA_sign(0, hash, hash_len, out, &out_len_unsigned, ec_key.get())) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.sync_mode_) {
++    // Return immediately with the results.
++    if (out_len_unsigned > max_out) {
++      return ssl_private_key_failure;
++    }
++    *out_len = out_len_unsigned;
++    return ssl_private_key_success;
++  }
++
++  ops->output_.assign(out, out + out_len_unsigned);
++  // Tell SSL socket that the operation is ready to be called again.
++  ops->delayed_op();
++
++  return ssl_private_key_retry;
++}
++
++static ssl_private_key_result_t ecdsaPrivateKeyDecrypt(SSL*, uint8_t*, size_t*, size_t,
++                                                       const uint8_t*, size_t) {
++  return ssl_private_key_failure;
++}
++
++static ssl_private_key_result_t rsaPrivateKeySign(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                  size_t max_out, uint16_t signature_algorithm,
++                                                  const uint8_t* in, size_t in_len) {
++  TestPrivateKeyConnection* ops = static_cast<TestPrivateKeyConnection*>(
++      SSL_get_ex_data(ssl, TestPrivateKeyMethodProvider::rsaConnectionIndex()));
++  unsigned char hash[EVP_MAX_MD_SIZE] = {0};
++  unsigned int hash_len = EVP_MAX_MD_SIZE;
++  std::vector<uint8_t> in2;
++
++  if (!ops) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.method_error_) {
++    return ssl_private_key_failure;
++  }
++
++  if (!ops->test_options_.sign_expected_) {
++    return ssl_private_key_failure;
++  }
++
++  const EVP_MD* md = SSL_get_signature_algorithm_digest(signature_algorithm);
++  if (!md) {
++    return ssl_private_key_failure;
++  }
++
++  in2.assign(in, in + in_len);
++
++  // If crypto error is set, we'll modify the incoming token by flipping
++  // the bits.
++  if (ops->test_options_.crypto_error_) {
++    for (size_t i = 0; i < in_len; i++) {
++      in2[i] = ~in2[i];
++    }
++  }
++
++  if (!calculateDigest(md, in2.data(), in_len, hash, &hash_len)) {
++    return ssl_private_key_failure;
++  }
++
++  RSA* rsa = EVP_PKEY_get0_RSA(ops->getPrivateKey());
++  if (rsa == nullptr) {
++    return ssl_private_key_failure;
++  }
++
++  // Perform RSA signing.
++  if (SSL_is_signature_algorithm_rsa_pss(signature_algorithm)) {
++    if (!RSA_sign_pss_mgf1(rsa, out_len, out, max_out, hash, hash_len, md, nullptr, -1)) {
++      return ssl_private_key_failure;
++    }
++  } else {
++    unsigned int out_len_unsigned;
++    if (!RSA_sign(EVP_MD_type(md), hash, hash_len, out, &out_len_unsigned, rsa)) {
++      return ssl_private_key_failure;
++    }
++    if (out_len_unsigned > max_out) {
++      return ssl_private_key_failure;
++    }
++    *out_len = out_len_unsigned;
++  }
++
++  if (ops->test_options_.sync_mode_) {
++    return ssl_private_key_success;
++  }
++
++  ops->output_.assign(out, out + *out_len);
++  ops->delayed_op();
++
++  return ssl_private_key_retry;
++}
++
++static ssl_private_key_result_t rsaPrivateKeyDecrypt(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                     size_t max_out, const uint8_t* in,
++                                                     size_t in_len) {
++  TestPrivateKeyConnection* ops = static_cast<TestPrivateKeyConnection*>(
++      SSL_get_ex_data(ssl, TestPrivateKeyMethodProvider::rsaConnectionIndex()));
++
++  if (!ops) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.method_error_) {
++    return ssl_private_key_failure;
++  }
++
++  if (!ops->test_options_.decrypt_expected_) {
++    return ssl_private_key_failure;
++  }
++
++  RSA* rsa = EVP_PKEY_get0_RSA(ops->getPrivateKey());
++  if (rsa == nullptr) {
++    return ssl_private_key_failure;
++  }
++
++  if (!RSA_decrypt(rsa, out_len, out, max_out, in, in_len, RSA_NO_PADDING)) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->test_options_.sync_mode_) {
++    return ssl_private_key_success;
++  }
++
++  ops->output_.assign(out, out + *out_len);
++  ops->delayed_op();
++
++  return ssl_private_key_retry;
++}
++
++static ssl_private_key_result_t privateKeyComplete(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                   size_t max_out, int id) {
++  TestPrivateKeyConnection* ops = static_cast<TestPrivateKeyConnection*>(SSL_get_ex_data(ssl, id));
++
++  if (!ops->finished_) {
++    // The operation didn't finish yet, retry.
++    return ssl_private_key_retry;
++  }
++
++  if (ops->test_options_.async_method_error_) {
++    return ssl_private_key_failure;
++  }
++
++  if (ops->output_.size() > max_out) {
++    return ssl_private_key_failure;
++  }
++
++  std::copy(ops->output_.begin(), ops->output_.end(), out);
++  *out_len = ops->output_.size();
++
++  return ssl_private_key_success;
++}
++
++static ssl_private_key_result_t rsaPrivateKeyComplete(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                      size_t max_out) {
++  return privateKeyComplete(ssl, out, out_len, max_out,
++                            TestPrivateKeyMethodProvider::rsaConnectionIndex());
++}
++
++static ssl_private_key_result_t ecdsaPrivateKeyComplete(SSL* ssl, uint8_t* out, size_t* out_len,
++                                                        size_t max_out) {
++  return privateKeyComplete(ssl, out, out_len, max_out,
++                            TestPrivateKeyMethodProvider::ecdsaConnectionIndex());
++}
++
++Ssl::BoringSslPrivateKeyMethodSharedPtr
++TestPrivateKeyMethodProvider::getBoringSslPrivateKeyMethod() {
++  return method_;
++}
++
++bool TestPrivateKeyMethodProvider::checkFips() {
++  if (mode_ == "rsa") {
++    RSA* rsa_private_key = EVP_PKEY_get0_RSA(pkey_.get());
++    if (rsa_private_key == nullptr || !RSA_check_fips(rsa_private_key)) {
++      return false;
++    }
++  } else { // if (mode_ == "ecdsa")
++    const EC_KEY* ecdsa_private_key = EVP_PKEY_get0_EC_KEY(pkey_.get());
++    if (ecdsa_private_key == nullptr || !EC_KEY_check_fips(ecdsa_private_key)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++TestPrivateKeyConnection::TestPrivateKeyConnection(
++    Ssl::PrivateKeyConnectionCallbacks& cb, Event::Dispatcher& dispatcher,
++    bssl::UniquePtr<EVP_PKEY> pkey, TestPrivateKeyConnectionTestOptions& test_options)
++    : test_options_(test_options), cb_(cb), dispatcher_(dispatcher), pkey_(std::move(pkey)) {}
++
++void TestPrivateKeyMethodProvider::registerPrivateKeyMethod(SSL* ssl,
++                                                            Ssl::PrivateKeyConnectionCallbacks& cb,
++                                                            Event::Dispatcher& dispatcher) {
++  TestPrivateKeyConnection* ops;
++  // In multi-cert case, when the same provider is used in different modes with the same SSL object,
++  // we need to keep both rsa and ecdsa connection objects in store because the test options for the
++  // two certificates may be different. We need to be able to deduct in the signing, decryption, and
++  // completion functions which options to use, so we associate the connection objects to the same
++  // SSL object using different user data indexes.
++  //
++  // Another way to do this would be to store both test options in one connection object.
++  int index = mode_ == "rsa" ? TestPrivateKeyMethodProvider::rsaConnectionIndex()
++                             : TestPrivateKeyMethodProvider::ecdsaConnectionIndex();
++
++  // Check if there is another certificate of the same mode associated with the context. This would
++  // be an error.
++  ops = static_cast<TestPrivateKeyConnection*>(SSL_get_ex_data(ssl, index));
++  if (ops != nullptr) {
++    throw EnvoyException(
++        "Can't distinguish between two registered providers for the same SSL object.");
++  }
++
++  ops = new TestPrivateKeyConnection(cb, dispatcher, bssl::UpRef(pkey_), test_options_);
++  SSL_set_ex_data(ssl, index, ops);
++}
++
++void TestPrivateKeyMethodProvider::unregisterPrivateKeyMethod(SSL* ssl) {
++  int index = mode_ == "rsa" ? TestPrivateKeyMethodProvider::rsaConnectionIndex()
++                             : TestPrivateKeyMethodProvider::ecdsaConnectionIndex();
++  TestPrivateKeyConnection* ops =
++      static_cast<TestPrivateKeyConnection*>(SSL_get_ex_data(ssl, index));
++  SSL_set_ex_data(ssl, index, nullptr);
++  delete ops;
++}
++
++static int createIndex() {
++  int index = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
++  RELEASE_ASSERT(index >= 0, "Failed to get SSL user data index.");
++  return index;
++}
++
++int TestPrivateKeyMethodProvider::rsaConnectionIndex() {
++  CONSTRUCT_ON_FIRST_USE(int, createIndex());
++}
++
++int TestPrivateKeyMethodProvider::ecdsaConnectionIndex() {
++  CONSTRUCT_ON_FIRST_USE(int, createIndex());
++}
++
++TestPrivateKeyMethodProvider::TestPrivateKeyMethodProvider(
++    const ProtobufWkt::Any& typed_config,
++    Server::Configuration::TransportSocketFactoryContext& factory_context) {
++  std::string private_key_path;
++
++  auto config = MessageUtil::anyConvert<ProtobufWkt::Struct>(typed_config);
++
++  for (auto& value_it : config.fields()) {
++    auto& value = value_it.second;
++    if (value_it.first == "private_key_file" &&
++        value.kind_case() == ProtobufWkt::Value::kStringValue) {
++      private_key_path = value.string_value();
++    }
++    if (value_it.first == "sync_mode" && value.kind_case() == ProtobufWkt::Value::kBoolValue) {
++      test_options_.sync_mode_ = value.bool_value();
++    }
++    if (value_it.first == "crypto_error" && value.kind_case() == ProtobufWkt::Value::kBoolValue) {
++      test_options_.crypto_error_ = value.bool_value();
++    }
++    if (value_it.first == "method_error" && value.kind_case() == ProtobufWkt::Value::kBoolValue) {
++      test_options_.method_error_ = value.bool_value();
++    }
++    if (value_it.first == "async_method_error" &&
++        value.kind_case() == ProtobufWkt::Value::kBoolValue) {
++      test_options_.async_method_error_ = value.bool_value();
++    }
++    if (value_it.first == "expected_operation" &&
++        value.kind_case() == ProtobufWkt::Value::kStringValue) {
++      if (value.string_value() == "decrypt") {
++        test_options_.decrypt_expected_ = true;
++      } else if (value.string_value() == "sign") {
++        test_options_.sign_expected_ = true;
++      }
++    }
++    if (value_it.first == "mode" && value.kind_case() == ProtobufWkt::Value::kStringValue) {
++      mode_ = value.string_value();
++    }
++  }
++
++  std::string private_key = factory_context.api().fileSystem().fileReadToEnd(private_key_path);
++  bssl::UniquePtr<BIO> bio(
++      BIO_new_mem_buf(const_cast<char*>(private_key.data()), private_key.size()));
++  bssl::UniquePtr<EVP_PKEY> pkey(PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr));
++  if (pkey == nullptr) {
++    throw EnvoyException("Failed to read private key from disk.");
++  }
++
++  method_ = std::make_shared<SSL_PRIVATE_KEY_METHOD>();
++
++  // Have two modes, "rsa" and "ecdsa", for testing multi-cert use cases.
++  if (mode_ == "rsa") {
++    if (EVP_PKEY_id(pkey.get()) != EVP_PKEY_RSA) {
++      throw EnvoyException("Private key is not RSA.");
++    }
++    method_->sign = rsaPrivateKeySign;
++    method_->decrypt = rsaPrivateKeyDecrypt;
++    method_->complete = rsaPrivateKeyComplete;
++  } else if (mode_ == "ecdsa") {
++    if (EVP_PKEY_id(pkey.get()) != EVP_PKEY_EC) {
++      throw EnvoyException("Private key is not ECDSA.");
++    }
++    method_->sign = ecdsaPrivateKeySign;
++    method_->decrypt = ecdsaPrivateKeyDecrypt;
++    method_->complete = ecdsaPrivateKeyComplete;
++  } else {
++    throw EnvoyException("Unknown test provider mode, supported modes are \"rsa\" and \"ecdsa\".");
++  }
++
++  pkey_ = std::move(pkey);
++}
++
++} // namespace PrivateKeyMethodProvider
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/test/extensions/transport_sockets/tls/test_private_key_method_provider.h b/test/extensions/transport_sockets/tls/test_private_key_method_provider.h
+new file mode 100644
+index 0000000..da0fcea
+--- /dev/null
++++ b/test/extensions/transport_sockets/tls/test_private_key_method_provider.h
+@@ -0,0 +1,99 @@
++#pragma once
++
++#include "envoy/event/dispatcher.h"
++#include "envoy/extensions/transport_sockets/tls/v3/cert.pb.h"
++#include "envoy/server/transport_socket_config.h"
++#include "envoy/ssl/private_key/private_key.h"
++#include "envoy/ssl/private_key/private_key_config.h"
++
++#include "common/config/utility.h"
++#include "common/protobuf/utility.h"
++
++#include "boringssl_compat/bssl.h"
++
++namespace Envoy {
++namespace Extensions {
++namespace PrivateKeyMethodProvider {
++
++struct TestPrivateKeyConnectionTestOptions {
++  // Return private key method value directly without asynchronous operation.
++  bool sync_mode_{};
++
++  // The "decrypt" private key method is expected to he called.
++  bool decrypt_expected_{};
++
++  // The "sign" private key method is expected to he called.
++  bool sign_expected_{};
++
++  // Add a cryptographic error (invalid signature, incorrect decryption).
++  bool crypto_error_{};
++
++  // Return an error from the private key method.
++  bool method_error_{};
++
++  // Return an error from the private key method completion function.
++  bool async_method_error_{};
++};
++
++// An example private key method provider for testing the decrypt() and sign()
++// functionality.
++class TestPrivateKeyConnection {
++public:
++  TestPrivateKeyConnection(Ssl::PrivateKeyConnectionCallbacks& cb, Event::Dispatcher& dispatcher,
++                           bssl::UniquePtr<EVP_PKEY> pkey,
++                           TestPrivateKeyConnectionTestOptions& test_options);
++  EVP_PKEY* getPrivateKey() { return pkey_.get(); }
++  void delayed_op();
++  // Store the output data temporarily.
++  std::vector<uint8_t> output_;
++  // The complete callback can return other value than "retry" only after
++  // onPrivateKeyMethodComplete() function has been called. This is controlled by "finished"
++  // variable.
++  bool finished_{};
++  TestPrivateKeyConnectionTestOptions& test_options_;
++
++private:
++  Ssl::PrivateKeyConnectionCallbacks& cb_;
++  Event::Dispatcher& dispatcher_;
++  bssl::UniquePtr<EVP_PKEY> pkey_;
++  // A zero-length timer controls the callback.
++  Event::TimerPtr timer_;
++};
++
++class TestPrivateKeyMethodProvider : public virtual Ssl::PrivateKeyMethodProvider {
++public:
++  TestPrivateKeyMethodProvider(
++      const ProtobufWkt::Any& typed_config,
++      Server::Configuration::TransportSocketFactoryContext& factory_context);
++  // Ssl::PrivateKeyMethodProvider
++  void registerPrivateKeyMethod(SSL* ssl, Ssl::PrivateKeyConnectionCallbacks& cb,
++                                Event::Dispatcher& dispatcher) override;
++  void unregisterPrivateKeyMethod(SSL* ssl) override;
++  bool checkFips() override;
++  Ssl::BoringSslPrivateKeyMethodSharedPtr getBoringSslPrivateKeyMethod() override;
++
++  static int rsaConnectionIndex();
++  static int ecdsaConnectionIndex();
++
++private:
++  Ssl::BoringSslPrivateKeyMethodSharedPtr method_{};
++  bssl::UniquePtr<EVP_PKEY> pkey_;
++  TestPrivateKeyConnectionTestOptions test_options_;
++  std::string mode_;
++};
++
++class TestPrivateKeyMethodFactory : public Ssl::PrivateKeyMethodProviderInstanceFactory {
++public:
++  // Ssl::PrivateKeyMethodProviderInstanceFactory
++  Ssl::PrivateKeyMethodProviderSharedPtr createPrivateKeyMethodProviderInstance(
++      const envoy::extensions::transport_sockets::tls::v3::PrivateKeyProvider& config,
++      Server::Configuration::TransportSocketFactoryContext& factory_context) override {
++    return std::make_shared<TestPrivateKeyMethodProvider>(config.typed_config(), factory_context);
++  }
++
++  std::string name() const override { return "test"; };
++};
++
++} // namespace PrivateKeyMethodProvider
++} // namespace Extensions
++} // namespace Envoy
+diff --git a/test/integration/BUILD b/test/integration/BUILD
+index f773abd..aa881ba 100644
+--- a/test/integration/BUILD
++++ b/test/integration/BUILD
+@@ -1079,3 +1079,34 @@ envoy_cc_test(
+         "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
+     ],
+ )
++
++envoy_cc_test(
++    name = "listener_filter_integration_test",
++    srcs = [
++        "listener_filter_integration_test.cc",
++    ],
++    data = [
++        "//test/config/integration/certs",
++    ],
++    deps = [
++        ":integration_lib",
++        "//source/common/config:api_version_lib",
++        "//source/common/event:dispatcher_includes",
++        "//source/common/event:dispatcher_lib",
++        "//source/common/network:utility_lib",
++        "//source/extensions/access_loggers/file:config",
++        "//source/extensions/filters/listener/tls_inspector:config",
++        "//source/extensions/filters/listener/tls_inspector:tls_inspector_lib",
++        "//source/extensions/filters/network/echo:config",
++        "//source/extensions/transport_sockets/tls:config",
++        "//source/extensions/transport_sockets/tls:context_config_lib",
++        "//source/extensions/transport_sockets/tls:context_lib",
++        "//test/mocks/runtime:runtime_mocks",
++        "//test/mocks/secret:secret_mocks",
++        "//test/test_common:utility_lib",
++        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
++        "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
++        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
++        "@envoy_api//envoy/extensions/access_loggers/file/v3:pkg_cc_proto",
++    ],
++)
+diff --git a/test/integration/autonomous_upstream.cc b/test/integration/autonomous_upstream.cc
+index a7724a6..70c14b7 100644
+--- a/test/integration/autonomous_upstream.cc
++++ b/test/integration/autonomous_upstream.cc
+@@ -66,7 +66,8 @@ AutonomousHttpConnection::AutonomousHttpConnection(SharedConnectionWrapper& shar
+                                                    Stats::Store& store, Type type,
+                                                    AutonomousUpstream& upstream)
+     : FakeHttpConnection(shared_connection, store, type, upstream.timeSystem(),
+-                         Http::DEFAULT_MAX_REQUEST_HEADERS_KB, Http::DEFAULT_MAX_HEADERS_COUNT),
++                         Http::DEFAULT_MAX_REQUEST_HEADERS_KB, Http::DEFAULT_MAX_HEADERS_COUNT,
++                         envoy::config::core::v3::HttpProtocolOptions::ALLOW),
+       upstream_(upstream) {}
+ 
+ Http::RequestDecoder& AutonomousHttpConnection::newStream(Http::ResponseEncoder& response_encoder,
+diff --git a/test/integration/fake_upstream.cc b/test/integration/fake_upstream.cc
+index d7c1a8a..bbef9d1 100644
+--- a/test/integration/fake_upstream.cc
++++ b/test/integration/fake_upstream.cc
+@@ -220,11 +220,12 @@ void FakeStream::finishGrpcStream(Grpc::Status::GrpcStatus status) {
+       Http::TestHeaderMapImpl{{"grpc-status", std::to_string(static_cast<uint32_t>(status))}});
+ }
+ 
+-FakeHttpConnection::FakeHttpConnection(SharedConnectionWrapper& shared_connection,
+-                                       Stats::Store& store, Type type,
+-                                       Event::TestTimeSystem& time_system,
+-                                       uint32_t max_request_headers_kb,
+-                                       uint32_t max_request_headers_count)
++FakeHttpConnection::FakeHttpConnection(
++    SharedConnectionWrapper& shared_connection, Stats::Store& store, Type type,
++    Event::TestTimeSystem& time_system, uint32_t max_request_headers_kb,
++    uint32_t max_request_headers_count,
++    envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
++        headers_with_underscores_action)
+     : FakeConnectionBase(shared_connection, time_system) {
+   if (type == Type::HTTP1) {
+     Http::Http1Settings http1_settings;
+@@ -232,7 +233,7 @@ FakeHttpConnection::FakeHttpConnection(SharedConnectionWrapper& shared_connectio
+     http1_settings.enable_trailers_ = true;
+     codec_ = std::make_unique<Http::Http1::ServerConnectionImpl>(
+         shared_connection_.connection(), store, *this, http1_settings, max_request_headers_kb,
+-        max_request_headers_count);
++        max_request_headers_count, headers_with_underscores_action);
+   } else {
+     envoy::config::core::v3::Http2ProtocolOptions http2_options =
+         ::Envoy::Http2::Utility::initializeAndValidateOptions(
+@@ -241,7 +242,7 @@ FakeHttpConnection::FakeHttpConnection(SharedConnectionWrapper& shared_connectio
+     http2_options.set_allow_metadata(true);
+     codec_ = std::make_unique<Http::Http2::ServerConnectionImpl>(
+         shared_connection_.connection(), *this, store, http2_options, max_request_headers_kb,
+-        max_request_headers_count);
++        max_request_headers_count, headers_with_underscores_action);
+     ASSERT(type == Type::HTTP2);
+   }
+ 
+@@ -472,11 +473,11 @@ void FakeUpstream::threadRoutine() {
+   }
+ }
+ 
+-AssertionResult FakeUpstream::waitForHttpConnection(Event::Dispatcher& client_dispatcher,
+-                                                    FakeHttpConnectionPtr& connection,
+-                                                    milliseconds timeout,
+-                                                    uint32_t max_request_headers_kb,
+-                                                    uint32_t max_request_headers_count) {
++AssertionResult FakeUpstream::waitForHttpConnection(
++    Event::Dispatcher& client_dispatcher, FakeHttpConnectionPtr& connection, milliseconds timeout,
++    uint32_t max_request_headers_kb, uint32_t max_request_headers_count,
++    envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
++        headers_with_underscores_action) {
+   Event::TestTimeSystem& time_system = timeSystem();
+   auto end_time = time_system.monotonicTime() + timeout;
+   {
+@@ -495,9 +496,9 @@ AssertionResult FakeUpstream::waitForHttpConnection(Event::Dispatcher& client_di
+     if (new_connections_.empty()) {
+       return AssertionFailure() << "Got a new connection event, but didn't create a connection.";
+     }
+-    connection = std::make_unique<FakeHttpConnection>(consumeConnection(), stats_store_, http_type_,
+-                                                      time_system, max_request_headers_kb,
+-                                                      max_request_headers_count);
++    connection = std::make_unique<FakeHttpConnection>(
++        consumeConnection(), stats_store_, http_type_, time_system, max_request_headers_kb,
++        max_request_headers_count, headers_with_underscores_action);
+   }
+   VERIFY_ASSERTION(connection->initialize());
+   VERIFY_ASSERTION(connection->readDisable(false));
+@@ -528,7 +529,7 @@ FakeUpstream::waitForHttpConnection(Event::Dispatcher& client_dispatcher,
+         connection = std::make_unique<FakeHttpConnection>(
+             upstream.consumeConnection(), upstream.stats_store_, upstream.http_type_,
+             upstream.timeSystem(), Http::DEFAULT_MAX_REQUEST_HEADERS_KB,
+-            Http::DEFAULT_MAX_HEADERS_COUNT);
++            Http::DEFAULT_MAX_HEADERS_COUNT, envoy::config::core::v3::HttpProtocolOptions::ALLOW);
+         lock.release();
+         VERIFY_ASSERTION(connection->initialize());
+         VERIFY_ASSERTION(connection->readDisable(false));
+diff --git a/test/integration/fake_upstream.h b/test/integration/fake_upstream.h
+index 548b39b..26379a3 100644
+--- a/test/integration/fake_upstream.h
++++ b/test/integration/fake_upstream.h
+@@ -69,6 +69,9 @@ public:
+   void setAddServedByHeader(bool add_header) { add_served_by_header_ = add_header; }
+   const Http::RequestTrailerMapPtr& trailers() { return trailers_; }
+   bool receivedData() { return received_data_; }
++  Http::Http1StreamEncoderOptionsOptRef http1StreamEncoderOptions() {
++    return encoder_.http1StreamEncoderOptions();
++  }
+ 
+   ABSL_MUST_USE_RESULT
+   testing::AssertionResult
+@@ -419,7 +422,9 @@ public:
+ 
+   FakeHttpConnection(SharedConnectionWrapper& shared_connection, Stats::Store& store, Type type,
+                      Event::TestTimeSystem& time_system, uint32_t max_request_headers_kb,
+-                     uint32_t max_request_headers_count);
++                     uint32_t max_request_headers_count,
++                     envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
++                         headers_with_underscores_action);
+ 
+   // By default waitForNewStream assumes the next event is a new stream and
+   // returns AssertionFailure if an unexpected event occurs. If a caller truly
+@@ -560,11 +565,13 @@ public:
+ 
+   // Returns the new connection via the connection argument.
+   ABSL_MUST_USE_RESULT
+-  testing::AssertionResult
+-  waitForHttpConnection(Event::Dispatcher& client_dispatcher, FakeHttpConnectionPtr& connection,
+-                        std::chrono::milliseconds timeout = TestUtility::DefaultTimeout,
+-                        uint32_t max_request_headers_kb = Http::DEFAULT_MAX_REQUEST_HEADERS_KB,
+-                        uint32_t max_request_headers_count = Http::DEFAULT_MAX_HEADERS_COUNT);
++  testing::AssertionResult waitForHttpConnection(
++      Event::Dispatcher& client_dispatcher, FakeHttpConnectionPtr& connection,
++      std::chrono::milliseconds timeout = TestUtility::DefaultTimeout,
++      uint32_t max_request_headers_kb = Http::DEFAULT_MAX_REQUEST_HEADERS_KB,
++      uint32_t max_request_headers_count = Http::DEFAULT_MAX_HEADERS_COUNT,
++      envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
++          headers_with_underscores_action = envoy::config::core::v3::HttpProtocolOptions::ALLOW);
+ 
+   ABSL_MUST_USE_RESULT
+   testing::AssertionResult
+@@ -666,9 +673,7 @@ private:
+     bool bindToPort() override { return true; }
+     bool handOffRestoredDestinationConnections() const override { return false; }
+     uint32_t perConnectionBufferLimitBytes() const override { return 0; }
+-    std::chrono::milliseconds listenerFiltersTimeout() const override {
+-      return std::chrono::milliseconds();
+-    }
++    std::chrono::milliseconds listenerFiltersTimeout() const override { return {}; }
+     bool continueOnListenerFiltersTimeout() const override { return false; }
+     Stats::Scope& listenerScope() override { return parent_.stats_store_; }
+     uint64_t listenerTag() const override { return 0; }
+@@ -680,11 +685,15 @@ private:
+     envoy::config::core::v3::TrafficDirection direction() const override {
+       return envoy::config::core::v3::UNSPECIFIED;
+     }
++    const std::vector<AccessLog::InstanceSharedPtr>& accessLogs() const override {
++      return empty_access_logs_;
++    }
+ 
+     FakeUpstream& parent_;
+     const std::string name_;
+     Network::NopConnectionBalancerImpl connection_balancer_;
+     const Network::ActiveUdpListenerFactoryPtr udp_listener_factory_;
++    const std::vector<AccessLog::InstanceSharedPtr> empty_access_logs_;
+   };
+ 
+   void threadRoutine();
+diff --git a/test/integration/http_integration.cc b/test/integration/http_integration.cc
+index db55653..f485f30 100644
+--- a/test/integration/http_integration.cc
++++ b/test/integration/http_integration.cc
+@@ -256,19 +256,6 @@ HttpIntegrationTest::~HttpIntegrationTest() {
+   fake_upstreams_.clear();
+ }
+ 
+-std::string HttpIntegrationTest::waitForAccessLog(const std::string& filename) {
+-  // Wait a max of 1s for logs to flush to disk.
+-  for (int i = 0; i < 1000; ++i) {
+-    std::string contents = TestEnvironment::readFileToStringForTest(filename, false);
+-    if (contents.length() > 0) {
+-      return contents;
+-    }
+-    absl::SleepFor(absl::Milliseconds(1));
+-  }
+-  RELEASE_ASSERT(0, "Timed out waiting for access log");
+-  return "";
+-}
+-
+ void HttpIntegrationTest::setDownstreamProtocol(Http::CodecClient::Type downstream_protocol) {
+   downstream_protocol_ = downstream_protocol;
+   config_helper_.setClientCodec(typeToCodecType(downstream_protocol_));
+@@ -411,7 +398,7 @@ void HttpIntegrationTest::checkSimpleRequestSuccess(uint64_t expected_request_si
+ }
+ 
+ void HttpIntegrationTest::testRouterRequestAndResponseWithBody(
+-    uint64_t request_size, uint64_t response_size, bool big_header,
++    uint64_t request_size, uint64_t response_size, bool big_header, bool set_content_length_header,
+     ConnectionCreationFunction* create_connection) {
+   initialize();
+   codec_client_ = makeHttpConnection(
+@@ -419,11 +406,16 @@ void HttpIntegrationTest::testRouterRequestAndResponseWithBody(
+   Http::TestRequestHeaderMapImpl request_headers{
+       {":method", "POST"},    {":path", "/test/long/url"}, {":scheme", "http"},
+       {":authority", "host"}, {"x-lyft-user-id", "123"},   {"x-forwarded-for", "10.0.0.1"}};
++  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
++  if (set_content_length_header) {
++    request_headers.setContentLength(request_size);
++    response_headers.setContentLength(response_size);
++  }
+   if (big_header) {
+     request_headers.addCopy("big", std::string(4096, 'a'));
+   }
+-  auto response = sendRequestAndWaitForResponse(request_headers, request_size,
+-                                                default_response_headers_, response_size);
++  auto response =
++      sendRequestAndWaitForResponse(request_headers, request_size, response_headers, response_size);
+   checkSimpleRequestSuccess(request_size, response_size, response.get());
+ }
+ 
+@@ -476,6 +468,51 @@ void HttpIntegrationTest::testRouterNotFoundWithBody() {
+   EXPECT_EQ("404", response->headers().Status()->value().getStringView());
+ }
+ 
++// Make sure virtual cluster stats are charged to the appropriate virtual cluster.
++void HttpIntegrationTest::testRouterVirtualClusters() {
++  const std::string matching_header = "x-use-test-vcluster";
++  config_helper_.addConfigModifier(
++      [matching_header](
++          envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
++              hcm) {
++        auto* route_config = hcm.mutable_route_config();
++        ASSERT_EQ(1, route_config->virtual_hosts_size());
++        auto* virtual_host = route_config->mutable_virtual_hosts(0);
++        {
++          auto* virtual_cluster = virtual_host->add_virtual_clusters();
++          virtual_cluster->set_name("test_vcluster");
++          auto* headers = virtual_cluster->add_headers();
++          headers->set_name(matching_header);
++          headers->set_present_match(true);
++        }
++      });
++  initialize();
++
++  codec_client_ = makeHttpConnection(lookupPort("http"));
++  Http::TestRequestHeaderMapImpl request_headers{{":method", "POST"},
++                                                 {":path", "/test/long/url"},
++                                                 {":scheme", "http"},
++                                                 {":authority", "host"},
++                                                 {matching_header, "true"}};
++
++  auto response = sendRequestAndWaitForResponse(request_headers, 0, default_response_headers_, 0);
++  checkSimpleRequestSuccess(0, 0, response.get());
++
++  test_server_->waitForCounterEq("vhost.integration.vcluster.test_vcluster.upstream_rq_total", 1);
++  test_server_->waitForCounterEq("vhost.integration.vcluster.other.upstream_rq_total", 0);
++
++  Http::TestRequestHeaderMapImpl request_headers2{{":method", "POST"},
++                                                  {":path", "/test/long/url"},
++                                                  {":scheme", "http"},
++                                                  {":authority", "host"}};
++
++  auto response2 = sendRequestAndWaitForResponse(request_headers2, 0, default_response_headers_, 0);
++  checkSimpleRequestSuccess(0, 0, response2.get());
++
++  test_server_->waitForCounterEq("vhost.integration.vcluster.test_vcluster.upstream_rq_total", 1);
++  test_server_->waitForCounterEq("vhost.integration.vcluster.other.upstream_rq_total", 1);
++}
++
+ void HttpIntegrationTest::testRouterUpstreamDisconnectBeforeRequestComplete() {
+   initialize();
+   codec_client_ = makeHttpConnection(lookupPort("http"));
+@@ -1130,6 +1167,48 @@ void HttpIntegrationTest::testTrailers(uint64_t request_size, uint64_t response_
+   }
+ }
+ 
++void HttpIntegrationTest::testAdminDrain(Http::CodecClient::Type admin_request_type) {
++  initialize();
++
++  uint32_t http_port = lookupPort("http");
++  codec_client_ = makeHttpConnection(http_port);
++  Http::TestRequestHeaderMapImpl request_headers{{":method", "HEAD"},
++                                                 {":path", "/test/long/url"},
++                                                 {":scheme", "http"},
++                                                 {":authority", "host"}};
++  IntegrationStreamDecoderPtr response = codec_client_->makeHeaderOnlyRequest(request_headers);
++  waitForNextUpstreamRequest(0);
++  fake_upstreams_[0]->set_allow_unexpected_disconnects(true);
++
++  upstream_request_->encodeHeaders(default_response_headers_, false);
++
++  // Invoke drain listeners endpoint and validate that we can still work on inflight requests.
++  BufferingStreamDecoderPtr admin_response = IntegrationUtil::makeSingleRequest(
++      lookupPort("admin"), "POST", "/drain_listeners", "", admin_request_type, version_);
++  EXPECT_TRUE(admin_response->complete());
++  EXPECT_EQ("200", admin_response->headers().Status()->value().getStringView());
++  EXPECT_EQ("OK\n", admin_response->body());
++
++  upstream_request_->encodeData(512, true);
++
++  ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
++
++  // Wait for the response to be read by the codec client.
++  response->waitForEndStream();
++
++  ASSERT_TRUE(response->complete());
++  EXPECT_THAT(response->headers(), Http::HttpStatusIs("200"));
++
++  // Validate that the listeners have been stopped.
++  test_server_->waitForCounterEq("listener_manager.listener_stopped", 1);
++
++  // Validate that port is closed and can be bound by other sockets.
++  EXPECT_NO_THROW(Network::TcpListenSocket(
++      Network::Utility::getAddressWithPort(*Network::Test::getCanonicalLoopbackAddress(version_),
++                                           http_port),
++      nullptr, true));
++}
++
+ std::string HttpIntegrationTest::listenerStatPrefix(const std::string& stat_name) {
+   if (version_ == Network::Address::IpVersion::v4) {
+     return "listener.127.0.0.1_0." + stat_name;
+diff --git a/test/integration/http_integration.h b/test/integration/http_integration.h
+index 3fbace2..99f2c88 100644
+--- a/test/integration/http_integration.h
++++ b/test/integration/http_integration.h
+@@ -87,22 +87,19 @@ public:
+   // https://github.com/envoyproxy/envoy-filter-example/pull/69 is reverted.
+   HttpIntegrationTest(Http::CodecClient::Type downstream_protocol,
+                       Network::Address::IpVersion version, TestTimeSystemPtr,
+-                      const std::string& config = ConfigHelper::HTTP_PROXY_CONFIG)
++                      const std::string& config = ConfigHelper::httpProxyConfig())
+       : HttpIntegrationTest(downstream_protocol, version, config) {}
+ 
+   HttpIntegrationTest(Http::CodecClient::Type downstream_protocol,
+                       Network::Address::IpVersion version,
+-                      const std::string& config = ConfigHelper::HTTP_PROXY_CONFIG);
++                      const std::string& config = ConfigHelper::httpProxyConfig());
+ 
+   HttpIntegrationTest(Http::CodecClient::Type downstream_protocol,
+                       const InstanceConstSharedPtrFn& upstream_address_fn,
+                       Network::Address::IpVersion version,
+-                      const std::string& config = ConfigHelper::HTTP_PROXY_CONFIG);
++                      const std::string& config = ConfigHelper::httpProxyConfig());
+   ~HttpIntegrationTest() override;
+ 
+-  // Waits for the first access log entry.
+-  std::string waitForAccessLog(const std::string& filename);
+-
+ protected:
+   void useAccessLog(absl::string_view format = "");
+ 
+@@ -173,9 +170,10 @@ protected:
+                                                     const std::string& authority = "host");
+   void testRouterNotFound();
+   void testRouterNotFoundWithBody();
++  void testRouterVirtualClusters();
+ 
+   void testRouterRequestAndResponseWithBody(uint64_t request_size, uint64_t response_size,
+-                                            bool big_header,
++                                            bool big_header, bool set_content_length_header = false,
+                                             ConnectionCreationFunction* creator = nullptr);
+   void testRouterHeaderOnlyRequestAndResponse(ConnectionCreationFunction* creator = nullptr,
+                                               int upstream_index = 0,
+@@ -220,6 +218,8 @@ protected:
+   // makes sure they were dropped.
+   void testTrailers(uint64_t request_size, uint64_t response_size, bool request_trailers_present,
+                     bool response_trailers_present);
++  // Test /drain_listener from admin portal.
++  void testAdminDrain(Http::CodecClient::Type admin_request_type);
+ 
+   Http::CodecClient::Type downstreamProtocol() const { return downstream_protocol_; }
+   // Prefix listener stat with IP:port, including IP version dependent loopback address.
+diff --git a/test/integration/integration.cc b/test/integration/integration.cc
+index a12c5a5..b1d39ff 100644
+--- a/test/integration/integration.cc
++++ b/test/integration/integration.cc
+@@ -209,6 +209,9 @@ void IntegrationTcpClient::waitForDisconnect(bool ignore_spurious_events) {
+ }
+ 
+ void IntegrationTcpClient::waitForHalfClose() {
++  if (payload_reader_->readLastByte()) {
++    return;
++  }
+   connection_->dispatcher().run(Event::Dispatcher::RunType::Block);
+   EXPECT_TRUE(payload_reader_->readLastByte());
+ }
+@@ -278,10 +281,15 @@ BaseIntegrationTest::BaseIntegrationTest(Network::Address::IpVersion version,
+           version, config) {}
+ 
+ Network::ClientConnectionPtr BaseIntegrationTest::makeClientConnection(uint32_t port) {
++  return makeClientConnectionWithOptions(port, nullptr);
++}
++
++Network::ClientConnectionPtr BaseIntegrationTest::makeClientConnectionWithOptions(
++    uint32_t port, const Network::ConnectionSocket::OptionsSharedPtr& options) {
+   Network::ClientConnectionPtr connection(dispatcher_->createClientConnection(
+       Network::Utility::resolveUrl(
+           fmt::format("tcp://{}:{}", Network::Test::getLoopbackAddressUrlString(version_), port)),
+-      Network::Address::InstanceConstSharedPtr(), Network::Test::createRawBufferSocket(), nullptr));
++      Network::Address::InstanceConstSharedPtr(), Network::Test::createRawBufferSocket(), options));
+ 
+   connection->enableHalfClose(enable_half_close_);
+   return connection;
+@@ -407,9 +415,20 @@ void BaseIntegrationTest::setUpstreamAddress(
+ }
+ 
+ void BaseIntegrationTest::registerTestServerPorts(const std::vector<std::string>& port_names) {
+-  auto port_it = port_names.cbegin();
+-  auto listeners = test_server_->server().listenerManager().listeners();
++  bool listeners_ready = false;
++  absl::Mutex l;
++  std::vector<std::reference_wrapper<Network::ListenerConfig>> listeners;
++  test_server_->server().dispatcher().post([this, &listeners, &listeners_ready, &l]() {
++    listeners = test_server_->server().listenerManager().listeners();
++    l.Lock();
++    listeners_ready = true;
++    l.Unlock();
++  });
++  l.LockWhen(absl::Condition(&listeners_ready));
++  l.Unlock();
++
+   auto listener_it = listeners.cbegin();
++  auto port_it = port_names.cbegin();
+   for (; port_it != port_names.end() && listener_it != listeners.end(); ++port_it, ++listener_it) {
+     const auto listen_addr = listener_it->get().listenSocketFactory().localAddress();
+     if (listen_addr->type() == Network::Address::Type::Ip) {
+@@ -521,6 +540,24 @@ IntegrationTestServerPtr BaseIntegrationTest::createIntegrationTestServer(
+                                        defer_listener_finalization_);
+ }
+ 
++void BaseIntegrationTest::useListenerAccessLog(absl::string_view format) {
++  listener_access_log_name_ = TestEnvironment::temporaryPath(TestUtility::uniqueFilename());
++  ASSERT_TRUE(config_helper_.setListenerAccessLog(listener_access_log_name_, format));
++}
++
++std::string BaseIntegrationTest::waitForAccessLog(const std::string& filename) {
++  // Wait a max of 1s for logs to flush to disk.
++  for (int i = 0; i < 1000; ++i) {
++    std::string contents = TestEnvironment::readFileToStringForTest(filename, false);
++    if (contents.length() > 0) {
++      return contents;
++    }
++    absl::SleepFor(absl::Milliseconds(1));
++  }
++  RELEASE_ASSERT(0, "Timed out waiting for access log");
++  return "";
++}
++
+ void BaseIntegrationTest::createXdsUpstream() {
+   if (create_xds_upstream_ == false) {
+     return;
+diff --git a/test/integration/integration.h b/test/integration/integration.h
+index 034623b..8c388b4 100644
+--- a/test/integration/integration.h
++++ b/test/integration/integration.h
+@@ -152,15 +152,15 @@ public:
+   // Creates a test fixture with an upstream bound to INADDR_ANY on an unspecified port using the
+   // provided IP |version|.
+   BaseIntegrationTest(Network::Address::IpVersion version,
+-                      const std::string& config = ConfigHelper::HTTP_PROXY_CONFIG);
++                      const std::string& config = ConfigHelper::httpProxyConfig());
+   BaseIntegrationTest(Network::Address::IpVersion version, TestTimeSystemPtr,
+-                      const std::string& config = ConfigHelper::HTTP_PROXY_CONFIG)
++                      const std::string& config = ConfigHelper::httpProxyConfig())
+       : BaseIntegrationTest(version, config) {}
+   // Creates a test fixture with a specified |upstream_address| function that provides the IP and
+   // port to use.
+   BaseIntegrationTest(const InstanceConstSharedPtrFn& upstream_address_fn,
+                       Network::Address::IpVersion version,
+-                      const std::string& config = ConfigHelper::HTTP_PROXY_CONFIG);
++                      const std::string& config = ConfigHelper::httpProxyConfig());
+ 
+   virtual ~BaseIntegrationTest() = default;
+ 
+@@ -197,7 +197,10 @@ public:
+   void setUpstreamAddress(uint32_t upstream_index,
+                           envoy::config::endpoint::v3::LbEndpoint& endpoint) const;
+ 
+-  virtual Network::ClientConnectionPtr makeClientConnection(uint32_t port);
++  Network::ClientConnectionPtr makeClientConnection(uint32_t port);
++  virtual Network::ClientConnectionPtr
++  makeClientConnectionWithOptions(uint32_t port,
++                                  const Network::ConnectionSocket::OptionsSharedPtr& options);
+ 
+   void registerTestServerPorts(const std::vector<std::string>& port_names);
+   void createTestServer(const std::string& json_path, const std::vector<std::string>& port_names);
+@@ -217,6 +220,13 @@ public:
+   Api::ApiPtr api_for_server_stat_store_;
+   MockBufferFactory* mock_buffer_factory_; // Will point to the dispatcher's factory.
+ 
++  // Enable the listener access log
++  void useListenerAccessLog(absl::string_view format = "");
++  // Waits for the first access log entry.
++  std::string waitForAccessLog(const std::string& filename);
++
++  std::string listener_access_log_name_;
++
+   // Functions for testing reloadable config (xDS)
+   void createXdsUpstream();
+   void createXdsConnection();
+@@ -318,7 +328,7 @@ public:
+       resource->set_name(TestUtility::xdsResourceName(temp_any));
+       resource->set_version(version);
+       resource->mutable_resource()->PackFrom(API_DOWNGRADE(message));
+-      for (const auto alias : aliases) {
++      for (const auto& alias : aliases) {
+         resource->add_aliases(alias);
+       }
+     }
+diff --git a/test/integration/listener_filter_integration_test.cc b/test/integration/listener_filter_integration_test.cc
+new file mode 100644
+index 0000000..425cf0e
+--- /dev/null
++++ b/test/integration/listener_filter_integration_test.cc
+@@ -0,0 +1,123 @@
++#include <memory>
++
++#include "envoy/config/bootstrap/v3/bootstrap.pb.h"
++#include "envoy/config/cluster/v3/cluster.pb.h"
++#include "envoy/config/core/v3/base.pb.h"
++#include "envoy/extensions/access_loggers/file/v3/file.pb.h"
++
++#include "common/config/api_version.h"
++#include "common/network/utility.h"
++
++#include "extensions/filters/listener/tls_inspector/tls_inspector.h"
++#include "extensions/transport_sockets/tls/context_manager_impl.h"
++
++#include "test/integration/integration.h"
++#include "test/integration/ssl_utility.h"
++#include "test/integration/utility.h"
++#include "test/mocks/secret/mocks.h"
++
++#include "gtest/gtest.h"
++
++namespace Envoy {
++namespace {
++
++class ListenerFilterIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
++                                      public BaseIntegrationTest {
++public:
++  ListenerFilterIntegrationTest()
++      : BaseIntegrationTest(GetParam(), ConfigHelper::baseConfig() + R"EOF(
++    filter_chains:
++      filters:
++       -  name: envoy.filters.network.echo
++)EOF") {}
++
++  ~ListenerFilterIntegrationTest() override = default;
++  std::string appendMatcher(const std::string& listener_filter, bool disabled) {
++    if (disabled) {
++      return listener_filter +
++             R"EOF(
++filter_disabled:
++  any_match: true
++)EOF";
++    } else {
++      return listener_filter +
++             R"EOF(
++filter_disabled:
++  not_match:
++    any_match: true
++)EOF";
++    }
++  }
++
++  void initializeWithListenerFilter(absl::optional<bool> listener_filter_disabled = absl::nullopt) {
++    config_helper_.renameListener("echo");
++    std::string tls_inspector_config = ConfigHelper::tlsInspectorFilter();
++    if (listener_filter_disabled.has_value()) {
++      tls_inspector_config = appendMatcher(tls_inspector_config, listener_filter_disabled.value());
++    }
++    config_helper_.addListenerFilter(tls_inspector_config);
++    config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
++      auto* filter_chain =
++          bootstrap.mutable_static_resources()->mutable_listeners(0)->mutable_filter_chains(0);
++      auto* alpn = filter_chain->mutable_filter_chain_match()->add_application_protocols();
++      *alpn = "envoyalpn";
++    });
++    config_helper_.addSslConfig();
++    BaseIntegrationTest::initialize();
++
++    context_manager_ =
++        std::make_unique<Extensions::TransportSockets::Tls::ContextManagerImpl>(timeSystem());
++  }
++
++  void setupConnections(bool listener_filter_disabled, bool expect_connection_open) {
++    initializeWithListenerFilter(listener_filter_disabled);
++
++    // Set up the SSL client.
++    Network::Address::InstanceConstSharedPtr address =
++        Ssl::getSslAddress(version_, lookupPort("echo"));
++    context_ = Ssl::createClientSslTransportSocketFactory({}, *context_manager_, *api_);
++    ssl_client_ = dispatcher_->createClientConnection(
++        address, Network::Address::InstanceConstSharedPtr(),
++        context_->createTransportSocket(
++            // nullptr
++            std::make_shared<Network::TransportSocketOptionsImpl>(
++                absl::string_view(""), std::vector<std::string>(),
++                std::vector<std::string>{"envoyalpn"})),
++        nullptr);
++    ssl_client_->addConnectionCallbacks(connect_callbacks_);
++    ssl_client_->connect();
++    while (!connect_callbacks_.connected() && !connect_callbacks_.closed()) {
++      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
++    }
++
++    if (expect_connection_open) {
++      ASSERT(connect_callbacks_.connected());
++      ASSERT_FALSE(connect_callbacks_.closed());
++    } else {
++      ASSERT_FALSE(connect_callbacks_.connected());
++      ASSERT(connect_callbacks_.closed());
++    }
++  }
++  std::unique_ptr<Ssl::ContextManager> context_manager_;
++  Network::TransportSocketFactoryPtr context_;
++  ConnectionStatusCallbacks connect_callbacks_;
++  testing::NiceMock<Secret::MockSecretManager> secret_manager_;
++  Network::ClientConnectionPtr ssl_client_;
++};
++
++// Each listener filter is enabled by default.
++TEST_P(ListenerFilterIntegrationTest, AllListenerFiltersAreEnabledByDefault) {
++  setupConnections(/*listener_filter_disabled=*/false, /*expect_connection_open=*/true);
++  ssl_client_->close(Network::ConnectionCloseType::NoFlush);
++}
++
++// The tls_inspector is disabled. The ALPN won't be sniffed out and no filter chain is matched.
++TEST_P(ListenerFilterIntegrationTest, DisabledTlsInspectorFailsFilterChainFind) {
++  setupConnections(/*listener_filter_disabled=*/true, /*expect_connection_open=*/false);
++}
++
++INSTANTIATE_TEST_SUITE_P(IpVersions, ListenerFilterIntegrationTest,
++                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
++                         TestUtility::ipTestParamsToString);
++} // namespace
++} // namespace Envoy
+diff --git a/test/integration/server.h b/test/integration/server.h
+index 7741e8c..13dfbe4 100644
+--- a/test/integration/server.h
++++ b/test/integration/server.h
+@@ -102,15 +102,15 @@ public:
+     return wrapped_scope_->nullGauge(str);
+   }
+ 
+-  Counter& counter(const std::string& name) override {
++  Counter& counterFromString(const std::string& name) override {
+     StatNameManagedStorage storage(name, symbolTable());
+     return counterFromStatName(storage.statName());
+   }
+-  Gauge& gauge(const std::string& name, Gauge::ImportMode import_mode) override {
++  Gauge& gaugeFromString(const std::string& name, Gauge::ImportMode import_mode) override {
+     StatNameManagedStorage storage(name, symbolTable());
+     return gaugeFromStatName(storage.statName(), import_mode);
+   }
+-  Histogram& histogram(const std::string& name, Histogram::Unit unit) override {
++  Histogram& histogramFromString(const std::string& name, Histogram::Unit unit) override {
+     StatNameManagedStorage storage(name, symbolTable());
+     return histogramFromStatName(storage.statName(), unit);
+   }
+@@ -150,9 +150,9 @@ public:
+     Thread::LockGuard lock(lock_);
+     return store_.counterFromStatNameWithTags(name, tags);
+   }
+-  Counter& counter(const std::string& name) override {
++  Counter& counterFromString(const std::string& name) override {
+     Thread::LockGuard lock(lock_);
+-    return store_.counter(name);
++    return store_.counterFromString(name);
+   }
+   ScopePtr createScope(const std::string& name) override {
+     Thread::LockGuard lock(lock_);
+@@ -164,9 +164,9 @@ public:
+     Thread::LockGuard lock(lock_);
+     return store_.gaugeFromStatNameWithTags(name, tags, import_mode);
+   }
+-  Gauge& gauge(const std::string& name, Gauge::ImportMode import_mode) override {
++  Gauge& gaugeFromString(const std::string& name, Gauge::ImportMode import_mode) override {
+     Thread::LockGuard lock(lock_);
+-    return store_.gauge(name, import_mode);
++    return store_.gaugeFromString(name, import_mode);
+   }
+   Histogram& histogramFromStatNameWithTags(const StatName& name, StatNameTagVectorOptConstRef tags,
+                                            Histogram::Unit unit) override {
+@@ -174,9 +174,9 @@ public:
+     return store_.histogramFromStatNameWithTags(name, tags, unit);
+   }
+   NullGaugeImpl& nullGauge(const std::string& name) override { return store_.nullGauge(name); }
+-  Histogram& histogram(const std::string& name, Histogram::Unit unit) override {
++  Histogram& histogramFromString(const std::string& name, Histogram::Unit unit) override {
+     Thread::LockGuard lock(lock_);
+-    return store_.histogram(name, unit);
++    return store_.histogramFromString(name, unit);
+   }
+   CounterOptConstRef findCounter(StatName name) const override {
+     Thread::LockGuard lock(lock_);
+diff --git a/test/mocks/server/mocks.h b/test/mocks/server/mocks.h
+index f05c200..57515cf 100644
+--- a/test/mocks/server/mocks.h
++++ b/test/mocks/server/mocks.h
+@@ -174,6 +174,7 @@ public:
+   MOCK_METHOD(Http::RequestHeaderMap&, getRequestHeaders, (), (const));
+   MOCK_METHOD(NiceMock<Http::MockStreamDecoderFilterCallbacks>&, getDecoderFilterCallbacks, (),
+               (const));
++  MOCK_METHOD(Http::Http1StreamEncoderOptionsOptRef, http1StreamEncoderOptions, ());
+ };
+ 
+ class MockDrainManager : public DrainManager {
+@@ -494,6 +495,7 @@ public:
+   MOCK_METHOD(ProtobufMessage::ValidationVisitor&, messageValidationVisitor, ());
+   MOCK_METHOD(Api::Api&, api, ());
+   Grpc::Context& grpcContext() override { return grpc_context_; }
++  MOCK_METHOD(Server::DrainManager&, drainManager, ());
+ 
+   testing::NiceMock<Upstream::MockClusterManager> cluster_manager_;
+   testing::NiceMock<Event::MockDispatcher> dispatcher_;
+-- 
+2.24.0
+
