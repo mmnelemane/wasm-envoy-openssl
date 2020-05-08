@@ -69,6 +69,9 @@ http_archive(
     urls = ["https://github.com/marcohu/rules_antlr/archive/3cc2f9502a54ceb7b79b37383316b23c4da66f9a.tar.gz"],
 )
 
+load("@rules_antlr//antlr:deps.bzl", "antlr_dependencies")
+antlr_dependencies(472)
+
 http_archive(
     name = "antlr4_runtimes",
     build_file_content = """
@@ -87,9 +90,6 @@ cc_library(
     strip_prefix = "antlr4-4.8",
     urls = ["https://github.com/antlr/antlr4/archive/4.8.tar.gz"],
 )
-
-load("@rules_antlr//antlr:deps.bzl", "antlr_dependencies")
-antlr_dependencies(48)
 
 http_archive(
     name = "proxy_wasm_cpp_host",
